@@ -51,6 +51,7 @@ pub fn imported_since(rt: RegistryType) -> u32 {
         | RegistryType::Terraform
         | RegistryType::Ansible
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan
         | RegistryType::Rpm
         | RegistryType::Deb
@@ -80,6 +81,7 @@ pub fn compat(rt: RegistryType) -> Compat {
         | RegistryType::Terraform
         | RegistryType::Ansible
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan
         | RegistryType::Rpm
         | RegistryType::Deb
@@ -104,6 +106,7 @@ pub fn note(rt: RegistryType) -> &'static str {
         | RegistryType::Terraform
         | RegistryType::Ansible
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan
         | RegistryType::Rpm
         | RegistryType::Deb
@@ -178,6 +181,7 @@ pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
         | RegistryType::Terraform
         | RegistryType::Ansible
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan
         | RegistryType::Rpm
         | RegistryType::Deb
@@ -217,6 +221,7 @@ pub(super) fn own_by(rt: RegistryType, key: &str) -> Own {
         | RegistryType::Terraform
         | RegistryType::Ansible
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan
         | RegistryType::Rpm
         | RegistryType::Deb
@@ -283,6 +288,7 @@ pub fn map_artifact(rt: RegistryType, art: &ArtifactRef) -> Mapping {
         | RegistryType::Terraform
         | RegistryType::Ansible
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan
         | RegistryType::Rpm
         | RegistryType::Deb
@@ -438,6 +444,7 @@ mod tests {
             (R::Ansible, [Transfer, Transfer, Transfer, Transfer]),
             (R::Nuget, [Transfer, Transfer, Transfer, Transfer]),
             (R::PubDart, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Hex, [Transfer, Transfer, Transfer, Transfer]),
             (R::Conan, [Transfer, Transfer, Transfer, Transfer]),
             (R::Rpm, [Transfer, Transfer, Transfer, Transfer]),
             (R::Deb, [Transfer, Transfer, Transfer, Transfer]),
@@ -535,6 +542,7 @@ mod tests {
             (R::Ansible, Unsupported, 1, false),
             (R::Nuget, Partial, 2, true),
             (R::PubDart, Unsupported, 1, false),
+            (R::Hex, Unsupported, 1, false),
             (R::Conan, Unsupported, 1, false),
             (R::Rpm, Unsupported, 1, false),
             (R::Deb, Unsupported, 1, false),

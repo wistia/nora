@@ -12,6 +12,7 @@ pub mod docker;
 pub mod docker_auth;
 pub(crate) mod gems;
 mod go;
+pub(crate) mod hex_registry;
 pub(crate) mod hf;
 mod maven;
 pub(crate) mod npm;
@@ -1162,6 +1163,100 @@ pub(crate) async fn proxy_fetch_conditional(
                         // hold its slot until the #585 stall recovery.
                         cb.record_failure(&cb_key, probe);
                         Err(ProxyError::Network(e.to_string()))
+                    }
+                };
+            }
+            let code = status.as_u16();
+            if (400..500).contains(&code) {
+                // 4xx — upstream alive; recover the breaker without clearing a
+                // real failure tally, consistent with proxy_fetch_core (#606).
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::NotFound);
+            }
+            if status.is_redirection() {
+                // A redirect the client did not follow (off the upstream's origin): the
+                // upstream answered, as in proxy_fetch_core.
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(code));
+            }
+            cb.record_failure(&cb_key, probe);
+            Err(ProxyError::Upstream(code))
+        }
+        Err(e) => {
+            cb.record_failure(&cb_key, probe);
+            Err(ProxyError::Network(e.to_string()))
+        }
+    }
+}
+
+/// Conditional fetch with a hard streaming body bound (including chunked responses).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_conditional_bounded(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+    max_bytes: u64,
+) -> Result<Revalidation, ProxyError> {
+    let auth_header = upstream_auth_header(auth)?;
+    let cb_key = scope.into().key();
+    let probe = cb.check(&cb_key)?;
+
+    let mut request = client.get(url).timeout(timeout);
+    if let Some(value) = auth_header {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    if let Some(ref etag) = validators.etag {
+        request = request.header(header::IF_NONE_MATCH, etag);
+    }
+    if let Some(ref lm) = validators.last_modified {
+        request = request.header(header::IF_MODIFIED_SINCE, lm);
+    }
+
+    match request.send().await {
+        Ok(mut response) => {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_MODIFIED {
+                cb.record_success(&cb_key, probe);
+                return Ok(Revalidation::NotModified);
+            }
+            if status.is_success() {
+                let new_validators = Validators {
+                    etag: header_string(&response, header::ETAG),
+                    last_modified: header_string(&response, header::LAST_MODIFIED),
+                };
+                let read = async {
+                    if content_length(response.headers()).is_some_and(|n| n > max_bytes) {
+                        return Err("upstream body exceeds configured limit".to_owned());
+                    }
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+                            return Err("upstream body exceeds configured limit".to_owned());
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(bytes)
+                }
+                .await;
+                return match read {
+                    Ok(body) => {
+                        cb.record_success(&cb_key, probe);
+                        Ok(Revalidation::Modified {
+                            body: body.to_vec(),
+                            validators: new_validators,
+                        })
+                    }
+                    Err(e) => {
+                        // 2xx but the body could not be read (e.g. a mid-stream
+                        // drop) — a fetch failure for the breaker, as in
+                        // proxy_fetch_core; unreported, a half-open probe would
+                        // hold its slot until the #585 stall recovery.
+                        cb.record_failure(&cb_key, probe);
+                        Err(ProxyError::Network(e))
                     }
                 };
             }
@@ -3461,6 +3556,11 @@ mod curation_label_whitelist {
         ("docker.rs", RegistryType::Docker, include_str!("docker.rs")),
         ("gems.rs", RegistryType::Gems, include_str!("gems.rs")),
         ("go.rs", RegistryType::Go, include_str!("go.rs")),
+        (
+            "hex_registry.rs",
+            RegistryType::Hex,
+            include_str!("hex_registry.rs"),
+        ),
         ("hf.rs", RegistryType::HuggingFace, include_str!("hf.rs")),
         ("maven.rs", RegistryType::Maven, include_str!("maven.rs")),
         ("npm.rs", RegistryType::Npm, include_str!("npm.rs")),

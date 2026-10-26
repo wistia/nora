@@ -247,6 +247,7 @@ fn build_context_full(
         ansible: AnsibleConfig::default(),
         nuget: NugetConfig::default(),
         pub_dart: crate::config::PubDartConfig::default(),
+        hex: crate::config::HexConfig::default(),
         conan: crate::config::ConanConfig::default(),
         rpm: crate::config::RpmConfig {
             enabled: true,

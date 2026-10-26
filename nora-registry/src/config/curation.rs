@@ -133,6 +133,8 @@ pub struct CurationConfig {
     #[serde(rename = "pub", default)]
     pub pub_dart: RegistryCurationOverride,
     #[serde(default)]
+    pub hex: RegistryCurationOverride,
+    #[serde(default)]
     pub conan: RegistryCurationOverride,
     #[serde(default)]
     pub rpm: RegistryCurationOverride,
@@ -181,6 +183,7 @@ impl Default for CurationConfig {
             ansible: RegistryCurationOverride::default(),
             nuget: RegistryCurationOverride::default(),
             pub_dart: RegistryCurationOverride::default(),
+            hex: RegistryCurationOverride::default(),
             conan: RegistryCurationOverride::default(),
             rpm: RegistryCurationOverride::default(),
             deb: RegistryCurationOverride::default(),
@@ -211,6 +214,7 @@ impl CurationConfig {
             RegistryType::Ansible => Some(&self.ansible),
             RegistryType::Nuget => Some(&self.nuget),
             RegistryType::PubDart => Some(&self.pub_dart),
+            RegistryType::Hex => Some(&self.hex),
             RegistryType::Conan => Some(&self.conan),
             RegistryType::Rpm => Some(&self.rpm),
             RegistryType::Deb => Some(&self.deb),
@@ -258,6 +262,7 @@ impl CurationConfig {
             ansible: _,
             nuget: _,
             pub_dart: _,
+            hex: _,
             conan: _,
             rpm: _,
             deb: _,
@@ -312,6 +317,7 @@ impl CurationConfig {
             RegistryType::Ansible => Some(&mut self.ansible),
             RegistryType::Nuget => Some(&mut self.nuget),
             RegistryType::PubDart => Some(&mut self.pub_dart),
+            RegistryType::Hex => Some(&mut self.hex),
             RegistryType::Conan => Some(&mut self.conan),
             RegistryType::Rpm => Some(&mut self.rpm),
             RegistryType::Deb => Some(&mut self.deb),
@@ -387,6 +393,7 @@ impl CurationConfig {
             ("ANSIBLE", &mut self.ansible),
             ("NUGET", &mut self.nuget),
             ("PUB", &mut self.pub_dart),
+            ("HEX", &mut self.hex),
             ("CONAN", &mut self.conan),
             ("RPM", &mut self.rpm),
             ("DEB", &mut self.deb),

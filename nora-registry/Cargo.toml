@@ -85,6 +85,10 @@ mimalloc = { version = "0.1", features = ["no_thp"], optional = true }
 # through tempfile.
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
+prost = "0.14"
+rsa = { version = "0.9", features = ["pem"] }
+sha2_010 = { package = "sha2", version = "0.10", features = ["oid"] }
+
 [dev-dependencies]
 # Paused clock for the tests of timers measured in seconds and minutes.
 tokio = { workspace = true, features = ["test-util"] }

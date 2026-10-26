@@ -1179,6 +1179,7 @@ pub fn curation_version(registry: RegistryType, version: &str) -> String {
         RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        RegistryType::Hex => pub_version_key(version).unwrap_or_else(|| version.to_string()),
         // A Hub commit is hex, served in lower case.
         RegistryType::HuggingFace => version.to_lowercase(),
         _ => version.to_string(),
@@ -1196,6 +1197,7 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
             RegistryType::Npm => npm_version_key(version),
             RegistryType::Go => go_version_key(version),
             RegistryType::PubDart => pub_version_key(version),
+            RegistryType::Hex => pub_version_key(version),
             _ => None,
         };
         // NuGet compares versions without case: the pattern and the spelling both fold.

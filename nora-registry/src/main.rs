@@ -3096,6 +3096,7 @@ mod rate_limited_routes_tests {
             (RegistryType::Ansible, "/ansible/"),
             (RegistryType::Nuget, "/nuget/v3/autocomplete"),
             (RegistryType::PubDart, "/pub/api/packages"),
+            (RegistryType::Hex, "/hex/public_key"),
             (RegistryType::Conan, "/conan/v1/ping"),
             (RegistryType::Rpm, "/rpm/x/x.html"),
             (RegistryType::Deb, "/deb/x/x.html"),
@@ -5152,6 +5153,9 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
                 registry_routes = registry_routes
                     .merge(registry::nuget_routes())
                     .merge(registry::nuget_alias_routes())
+            }
+            RegistryType::Hex => {
+                registry_routes = registry_routes.merge(registry::hex_registry::routes())
             }
             RegistryType::PubDart => {
                 registry_routes = registry_routes.merge(registry::pub_dart_routes())
