@@ -245,6 +245,7 @@ impl Storage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         virtual_hosted: bool,
+        anonymous: bool,
     ) -> Self {
         Self {
             inner: Arc::new(ObjectStorage::new(
@@ -254,6 +255,7 @@ impl Storage {
                 access_key,
                 secret_key,
                 virtual_hosted,
+                anonymous,
             )),
         }
     }

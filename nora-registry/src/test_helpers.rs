@@ -181,6 +181,7 @@ fn build_context_full(
             s3_secret_key: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         },

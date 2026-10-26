@@ -536,7 +536,7 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
 | Swagger/OpenAPI | Full | `/api-docs` |
-| S3 backend | Full | AWS S3, Ceph RGW. Basic storage works on any S3-compatible; multi-replica write-serialization has a caveat — see note below. |
+| S3 backend | Full | AWS S3, Ceph RGW. Explicit keys or AWS environment/IRSA/EKS Pod Identity/ECS/EC2 credentials; unsigned access requires `storage.s3_anonymous = true`. See [S3 credentials](docs/s3-credentials.md). Multi-replica write-serialization has a caveat — see note below. |
 | GCS backend | Full | Native Google Cloud Storage (`storage.mode = "gcs"`): Workload Identity / service-account JSON / ambient credentials; endpoint override for emulators and Private Google Access. Same single-writer caveat as S3 for rpm/deb publishing (in-process publish lock). Hash-pinning (at-rest integrity verification) works on every backend: the pin is the `sha256` object metadata on S3/GCS. |
 | Local filesystem backend | Full | Default, content-addressable |
 | Activity log | Full | Recent push/pull in dashboard |
