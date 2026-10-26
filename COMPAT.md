@@ -21,6 +21,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
 | Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |
 | NuGet | ✅ | ❌ | `api.nuget.org` | proxy only — `dotnet nuget push` not implemented |
+| Hex (Elixir) | ✅ | ❌ | `repo.hex.pm` | opt-in; public Hex.pm; signed records preserved; server tarball cooldown |
 | Pub (Dart/Flutter) | ✅ | ❌ | `pub.dev` | proxy only — `dart pub publish` not implemented |
 | CPAN | ✅ | — | `www.cpan.org` | proxy only |
 | Conan (C/C++) | ✅ | ❌ | `center2.conan.io` | proxy only (Conan 2 clients) |
@@ -563,3 +564,14 @@ workload identity from CI, send the JWT as a `Bearer` token (e.g.
   AWS S3 and Ceph RGW provide it; **Garage** (no consensus layer) and **SeaweedFS**
   (immature) do not — on those, run single-writer. Not every "S3-compatible" backend is
   equivalent here.
+
+## Hex (Elixir)
+
+Explicitly opt-in (`hex` in `[registries].enable`; excluded from `all`). Public
+Hex.pm GET/HEAD package records, names, versions, tarballs and public key are
+supported. Records retain original signatures and origin; tarballs are checked
+against signed outer checksums. Server-side cooldown applies to locked and direct
+downloads; Hex 2.6.0 client cooldown helps resolution without rewriting metadata.
+Publishing, private repositories, docs, installation archives, CLI mirror and
+import are outside this implementation. See [configuration and trust](docs/hex.md)
+and [real-client verification](tests/hex-client/VERIFICATION.md).

@@ -354,6 +354,8 @@ pub struct Config {
     #[serde(default)]
     pub pub_dart: PubDartConfig,
     #[serde(default)]
+    pub hex: HexConfig,
+    #[serde(default)]
     pub conan: ConanConfig,
     #[serde(default)]
     pub rpm: RpmConfig,
@@ -414,6 +416,7 @@ pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
         RegistryType::Ansible => "NORA_ANSIBLE_ENABLED",
         RegistryType::Nuget => "NORA_NUGET_ENABLED",
         RegistryType::PubDart => "NORA_PUB_ENABLED",
+        RegistryType::Hex => "NORA_HEX_ENABLED",
         RegistryType::Conan => "NORA_CONAN_ENABLED",
         RegistryType::Rpm => "NORA_RPM_ENABLED",
         RegistryType::Deb => "NORA_DEB_ENABLED",
@@ -440,6 +443,7 @@ pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
         | RegistryType::Ansible
         | RegistryType::Nuget
         | RegistryType::PubDart
+        | RegistryType::Hex
         | RegistryType::Conan => ReleaseDateCheck::Dated,
     }
 }
@@ -599,6 +603,7 @@ impl Config {
                 RegistryType::Ansible => self.ansible.enabled = on,
                 RegistryType::Nuget => self.nuget.enabled = on,
                 RegistryType::PubDart => self.pub_dart.enabled = on,
+                RegistryType::Hex => self.hex.enabled = on,
                 RegistryType::Conan => self.conan.enabled = on,
                 RegistryType::Rpm => self.rpm.enabled = on,
                 RegistryType::Deb => self.deb.enabled = on,
@@ -643,6 +648,9 @@ impl Config {
         }
         if self.nuget.enabled {
             set.insert(RegistryType::Nuget);
+        }
+        if self.hex.enabled {
+            set.insert(RegistryType::Hex);
         }
         if self.pub_dart.enabled {
             set.insert(RegistryType::PubDart);
@@ -712,6 +720,7 @@ impl Config {
             RegistryType::Ansible => self.ansible.enabled && self.ansible.proxy.is_some(),
             RegistryType::Nuget => self.nuget.enabled && self.nuget.proxy.is_some(),
             RegistryType::PubDart => self.pub_dart.enabled && self.pub_dart.proxy.is_some(),
+            RegistryType::Hex => self.hex.enabled && self.hex.proxy.is_some(),
             RegistryType::Conan => self.conan.enabled && self.conan.proxy.is_some(),
             RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
             RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
@@ -749,6 +758,7 @@ impl Config {
             RegistryType::Ansible => self.curation.ansible.quarantine.as_ref(),
             RegistryType::Nuget => self.curation.nuget.quarantine.as_ref(),
             RegistryType::PubDart => self.curation.pub_dart.quarantine.as_ref(),
+            RegistryType::Hex => self.curation.hex.quarantine.as_ref(),
             RegistryType::Conan => self.curation.conan.quarantine.as_ref(),
             RegistryType::Rpm => self.curation.rpm.quarantine.as_ref(),
             RegistryType::Deb => self.curation.deb.quarantine.as_ref(),
@@ -934,6 +944,7 @@ impl Config {
             ("ansible", self.ansible.proxy.as_deref()),
             ("nuget", self.nuget.proxy.as_deref()),
             ("pub", self.pub_dart.proxy.as_deref()),
+            ("hex", self.hex.proxy.as_deref()),
             ("conan", self.conan.proxy.as_deref()),
             ("cpan", self.cpan.proxy.as_deref()),
             // Not hf: its metadata carries the Hub's host as content (a model card's
@@ -1056,6 +1067,21 @@ impl Config {
     ) -> (Vec<String>, Vec<String>) {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
+
+        if self.hex.enabled {
+            if let Some(path) = &self.hex.public_key_file {
+                use rsa::pkcs8::DecodePublicKey;
+                let valid = std::fs::read_to_string(path)
+                    .ok()
+                    .is_some_and(|pem| rsa::RsaPublicKey::from_public_key_pem(&pem).is_ok());
+                if !valid {
+                    errors.push("hex.public_key_file must contain a readable RSA public key in SPKI PEM format".into());
+                }
+            }
+            if self.hex.proxy_timeout == 0 {
+                errors.push("hex.proxy_timeout must be positive".into());
+            }
+        }
 
         // 1. Port must not be 0
         if self.server.port == 0 {
@@ -1674,6 +1700,7 @@ impl Config {
         self.ansible.apply_env_overrides();
         self.nuget.apply_env_overrides();
         self.pub_dart.apply_env_overrides();
+        self.hex.apply_env_overrides();
         self.conan.apply_env_overrides();
         self.rpm.apply_env_overrides();
         self.deb.apply_env_overrides();
@@ -2980,6 +3007,8 @@ proxies = [
             [nuget]
             proxy_auth = "u:p"  # secret
             [pub_dart]
+            proxy_auth = "u:p"  # secret
+            [hex]
             proxy_auth = "u:p"  # secret
             [conan]
             proxy_auth = "u:p"  # secret
@@ -4296,6 +4325,7 @@ proxies = [
             &mut config.curation.ansible,
             &mut config.curation.nuget,
             &mut config.curation.pub_dart,
+            &mut config.curation.hex,
             &mut config.curation.conan,
             &mut config.curation.rpm,
             &mut config.curation.deb,
@@ -4511,6 +4541,7 @@ proxies = [
             (RegistryType::Ansible, Dated),
             (RegistryType::Nuget, Dated),
             (RegistryType::PubDart, Dated),
+            (RegistryType::Hex, Dated),
             (RegistryType::Conan, Dated),
             (RegistryType::Rpm, NoNameOrDate),
             (RegistryType::Deb, NoNameOrDate),
@@ -4541,6 +4572,7 @@ proxies = [
             (RegistryType::Ansible, "[ansible]\nenabled = true\nproxy = \"https://galaxy.ansible.com\"\n", none),
             (RegistryType::Nuget, "[nuget]\nenabled = true\nproxy = \"https://api.nuget.org/v3/index.json\"\n", none),
             (RegistryType::PubDart, "[pub_dart]\nenabled = true\nproxy = \"https://pub.dev\"\n", none),
+            (RegistryType::Hex, "[hex]\nenabled = true\nproxy = \"https://repo.hex.pm\"\n", none),
             (RegistryType::Conan, "[conan]\nenabled = true\nproxy = \"https://center2.conan.io\"\n", none),
             (RegistryType::Rpm, "[rpm]\nenabled = true\n[rpm.proxies]\nfedora = \"https://repo.example.com/fedora\"\n", none),
             (RegistryType::Deb, "[deb]\nenabled = true\n[deb.proxies]\ndebian = \"https://deb.debian.org/debian\"\n", none),
@@ -4564,6 +4596,7 @@ proxies = [
             RegistryType::Ansible => (c.ansible.enabled, c.ansible.proxy) = (true, None),
             RegistryType::Nuget => (c.nuget.enabled, c.nuget.proxy) = (true, None),
             RegistryType::PubDart => (c.pub_dart.enabled, c.pub_dart.proxy) = (true, None),
+            RegistryType::Hex => (c.hex.enabled, c.hex.proxy) = (true, None),
             RegistryType::Conan => (c.conan.enabled, c.conan.proxy) = (true, None),
             RegistryType::Rpm => (c.rpm.enabled, c.rpm.proxies) = (true, Default::default()),
             RegistryType::Deb => (c.deb.enabled, c.deb.proxies) = (true, Default::default()),
@@ -4587,6 +4620,7 @@ proxies = [
             RegistryType::Ansible => c.ansible.enabled = false,
             RegistryType::Nuget => c.nuget.enabled = false,
             RegistryType::PubDart => c.pub_dart.enabled = false,
+            RegistryType::Hex => c.hex.enabled = false,
             RegistryType::Conan => c.conan.enabled = false,
             RegistryType::Rpm => c.rpm.enabled = false,
             RegistryType::Deb => c.deb.enabled = false,
@@ -4907,6 +4941,7 @@ proxies = [
         for rt in RegistryType::all() {
             let section = match rt {
                 RegistryType::PubDart => "pub_dart".to_string(),
+                RegistryType::Hex => "hex".to_string(),
                 _ => rt.as_str().to_string(),
             };
             all_off.push_str(&format!("[{section}]\nenabled = false\n"));
@@ -5003,6 +5038,7 @@ proxies = [
             RegistryType::Ansible => Some("ANSIBLE"),
             RegistryType::Nuget => Some("NUGET"),
             RegistryType::PubDart => Some("PUB"),
+            RegistryType::Hex => Some("HEX"),
             RegistryType::Conan => Some("CONAN"),
             RegistryType::Rpm => Some("RPM"),
             RegistryType::Deb => Some("DEB"),

@@ -638,6 +638,7 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key:
         | crate::registry_type::RegistryType::Terraform
         | crate::registry_type::RegistryType::Ansible
         | crate::registry_type::RegistryType::PubDart
+        | crate::registry_type::RegistryType::Hex
         | crate::registry_type::RegistryType::Conan
         | crate::registry_type::RegistryType::Rpm
         | crate::registry_type::RegistryType::Deb

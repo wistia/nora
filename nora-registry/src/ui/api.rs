@@ -34,6 +34,7 @@ pub struct RegistryStats {
     pub ansible: usize,
     #[serde(rename = "pub")]
     pub pub_dart: usize,
+    pub hex: usize,
     pub conan: usize,
     pub rpm: usize,
     pub deb: usize,
@@ -177,6 +178,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         terraform: get(RegistryType::Terraform),
         ansible: get(RegistryType::Ansible),
         pub_dart: get(RegistryType::PubDart),
+        hex: get(RegistryType::Hex),
         conan: get(RegistryType::Conan),
         rpm: get(RegistryType::Rpm),
         deb: get(RegistryType::Deb),
@@ -264,6 +266,7 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
                 RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
                 RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+                RegistryType::Hex => state.config.hex.proxy.clone().into_iter().collect(),
                 RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
                 RegistryType::Rpm => vec![],
                 RegistryType::Deb => vec![],
@@ -1160,6 +1163,9 @@ pub async fn get_generic_detail(
         Some(RegistryType::Gems) => {
             get_gems_detail(storage, &name_lower, show_prerelease, show_all).await
         }
+        Some(RegistryType::Hex) => {
+            get_hex_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
         Some(RegistryType::PubDart) => {
             get_pub_detail(storage, &name_lower, show_prerelease, show_all).await
         }
@@ -1824,6 +1830,38 @@ pub async fn get_cpan_detail(
 }
 
 /// Fallback: scan storage for files matching {registry}/{name}/*
+async fn get_hex_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
+    let prefix = format!("hex/tarballs/{name}-");
+    let mut versions = Vec::new();
+    for (key, meta) in storage.list_with_meta(&prefix).await.unwrap_or_default() {
+        if let Some(version) = key
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".tar"))
+        {
+            versions.push(VersionInfo {
+                version: version.to_owned(),
+                size: meta.size,
+                published: format_timestamp(meta.modified),
+                cached: true,
+            });
+        }
+    }
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
+    PackageDetail {
+        versions,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
+    }
+}
+
 async fn get_storage_scan_detail(
     storage: &Storage,
     registry: &str,
