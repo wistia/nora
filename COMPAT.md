@@ -572,6 +572,8 @@ Hex.pm GET/HEAD package records, names, versions, tarballs and public key are
 supported. Records retain original signatures and origin; tarballs are checked
 against signed outer checksums. Server-side cooldown applies to locked and direct
 downloads; Hex 2.6.0 client cooldown helps resolution without rewriting metadata.
+Exact `curation.hex.cooldown_exempt_packages` entries skip only the server cooldown;
+cryptographic verification and other curation checks remain active.
 Publishing, private repositories, docs, installation archives, CLI mirror and
 import are outside this implementation. See [configuration and trust](docs/hex.md)
 and [real-client verification](tests/hex-client/VERIFICATION.md).

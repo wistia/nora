@@ -156,6 +156,10 @@ pub struct RegistryCurationOverride {
     /// Override quarantine TTL for this specific registry.
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
+    /// Exact Hex package names exempt from release age and digest quarantine.
+    /// Only supported for Hex; other registry sections reject non-empty lists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldown_exempt_packages: Vec<String>,
 }
 
 impl Default for CurationConfig {
@@ -282,6 +286,7 @@ impl CurationConfig {
             let RegistryCurationOverride {
                 // In the engine a reload builds.
                 min_release_age: _,
+                cooldown_exempt_packages: _,
                 quarantine,
                 quarantine_ttl,
             } = own;
@@ -326,8 +331,40 @@ impl CurationConfig {
         }
     }
 
+    /// Validate exemption declarations at startup and on curation reload.
+    pub fn cooldown_exemption_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for &registry in RegistryType::all() {
+            if let Some(section) = self.registry_override(registry) {
+                for name in &section.cooldown_exempt_packages {
+                    if registry != RegistryType::Hex {
+                        errors.push(format!("curation.{registry}.cooldown_exempt_packages is only supported for hex"));
+                    } else if name.is_empty()
+                        || !name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    {
+                        errors.push(format!("curation.hex.cooldown_exempt_packages: {name:?} must be an exact lowercase Hex package name (no wildcards or scopes)"));
+                    }
+                }
+            }
+        }
+
+        errors
+    }
+
     /// Apply environment variable overrides for curation config.
     pub(super) fn apply_env_overrides(&mut self) -> Result<(), String> {
+        if let Ok(value) = env::var("NORA_CURATION_HEX_COOLDOWN_EXEMPT_PACKAGES") {
+            self.hex.cooldown_exempt_packages = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_owned())
+                    .collect()
+            };
+        }
         if let Ok(val) = env::var("NORA_CURATION_MODE") {
             self.mode = val
                 .parse::<CurationMode>()

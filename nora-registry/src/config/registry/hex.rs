@@ -92,6 +92,59 @@ mod tests {
         assert!(!HexConfig::default().enabled);
     }
     #[test]
+    fn hex_cooldown_exemption_config_validates_exact_names_and_rejects_other_registries() {
+        let _lock = crate::test_env::env_lock();
+        for (name, valid) in [
+            ("jason", true),
+            ("wistia_player", true),
+            ("*", false),
+            ("jason*", false),
+            ("@wistia", false),
+            ("Jason", false),
+            ("", false),
+        ] {
+            let mut cfg = crate::config::Config::default();
+            cfg.curation.hex.cooldown_exempt_packages = vec![name.into()];
+            let (_, errors) = cfg.validate();
+            assert_eq!(
+                errors
+                    .iter()
+                    .all(|e| !e.contains("cooldown_exempt_packages")),
+                valid,
+                "{name}: {errors:?}"
+            );
+        }
+        let mut cfg = crate::config::Config::default();
+        cfg.curation.npm.cooldown_exempt_packages = vec!["jason".into()];
+        assert!(cfg
+            .validate()
+            .1
+            .iter()
+            .any(|e| e.contains("only supported for hex")));
+    }
+
+    #[test]
+    fn hex_cooldown_exemption_env_is_comma_separated_and_empty_clears_it() {
+        let _lock = crate::test_env::env_lock();
+        let key = "NORA_CURATION_HEX_COOLDOWN_EXEMPT_PACKAGES";
+        let old = std::env::var_os(key);
+        let mut cfg = crate::config::CurationConfig::default();
+        std::env::set_var(key, "jason, wistia_player");
+        cfg.apply_env_overrides().unwrap();
+        assert_eq!(
+            cfg.hex.cooldown_exempt_packages,
+            vec!["jason", "wistia_player"]
+        );
+        std::env::set_var(key, "");
+        cfg.apply_env_overrides().unwrap();
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        assert!(cfg.hex.cooldown_exempt_packages.is_empty());
+    }
+
+    #[test]
     fn hex_env_overrides_are_applied() {
         let _lock = crate::test_env::env_lock();
         let old = std::env::var_os("NORA_HEX_METADATA_TTL");
