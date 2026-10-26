@@ -26,10 +26,10 @@ pub struct StorageConfig {
     pub s3_url: String,
     #[serde(default = "default_bucket")]
     pub bucket: String,
-    /// S3 access key (optional, uses anonymous access if not set)
+    /// S3 access key (optional, uses the AWS credential chain if not set).
     #[serde(default, skip_serializing)]
     pub s3_access_key: Option<ProtectedString>,
-    /// S3 secret key (optional, uses anonymous access if not set)
+    /// S3 secret key (optional, uses the AWS credential chain if not set).
     #[serde(default, skip_serializing)]
     pub s3_secret_key: Option<ProtectedString>,
     /// S3 region (default: us-east-1)
@@ -42,6 +42,10 @@ pub struct StorageConfig {
     /// Cloud OSS answers them with 403 `SecondLevelDomainForbidden`.
     #[serde(default)]
     pub s3_virtual_hosted: bool,
+    /// Disable S3 request signing for anonymous buckets or emulators.
+    /// Default: false. Cannot be combined with explicit S3 credentials.
+    #[serde(default)]
+    pub s3_anonymous: bool,
     /// GCS: path to a service-account JSON key file. Unset = ambient
     /// credentials (GOOGLE_* env, then the instance metadata server — GKE
     /// Workload Identity / GCE service accounts need no key material).
@@ -87,6 +91,7 @@ impl Default for StorageConfig {
             s3_secret_key: None,
             s3_region: default_s3_region(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         }
@@ -146,7 +151,28 @@ impl StorageConfig {
         if let Ok(val) = env::var("NORA_STORAGE_S3_VIRTUAL_HOSTED") {
             self.s3_virtual_hosted = val.to_lowercase() == "true" || val == "1";
         }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_ANONYMOUS") {
+            self.s3_anonymous = match val.to_lowercase().as_str() {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err("NORA_STORAGE_S3_ANONYMOUS must be true, false, 1, or 0".into()),
+            };
+        }
 
+        Ok(())
+    }
+
+    pub(super) fn validate_s3_credentials(&self) -> Result<(), String> {
+        if self.s3_access_key.is_some() != self.s3_secret_key.is_some() {
+            return Err(
+                "storage.s3_access_key and storage.s3_secret_key must be set together".into(),
+            );
+        }
+        if self.s3_anonymous && self.s3_access_key.is_some() {
+            return Err(
+                "storage.s3_anonymous cannot be combined with explicit S3 credentials".into(),
+            );
+        }
         Ok(())
     }
 }
@@ -155,6 +181,42 @@ impl StorageConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_authentication_configuration_is_explicit() {
+        let mut cfg: StorageConfig = toml::from_str("mode = \"s3\"").unwrap();
+        assert!(!cfg.s3_anonymous);
+        assert!(cfg.validate_s3_credentials().is_ok());
+        cfg.s3_access_key = Some(ProtectedString::new("access".into()));
+        assert!(cfg.validate_s3_credentials().is_err());
+        cfg.s3_secret_key = Some(ProtectedString::new("secret".into()));
+        assert!(cfg.validate_s3_credentials().is_ok());
+        cfg.s3_anonymous = true;
+        assert!(cfg.validate_s3_credentials().is_err());
+        cfg.s3_access_key = None;
+        assert!(cfg.validate_s3_credentials().is_err());
+        cfg.s3_secret_key = None;
+        assert!(cfg.validate_s3_credentials().is_ok());
+    }
+
+    #[test]
+    fn s3_anonymous_env_requires_a_boolean() {
+        let _lock = crate::test_env::env_lock();
+        let saved = std::env::var_os("NORA_STORAGE_S3_ANONYMOUS");
+        let mut cfg = StorageConfig::default();
+        for (value, expected) in [("true", true), ("0", false), ("1", true), ("false", false)] {
+            std::env::set_var("NORA_STORAGE_S3_ANONYMOUS", value);
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.s3_anonymous, expected);
+        }
+        std::env::set_var("NORA_STORAGE_S3_ANONYMOUS", "treu");
+        let result = cfg.apply_env_overrides();
+        match saved {
+            Some(value) => std::env::set_var("NORA_STORAGE_S3_ANONYMOUS", value),
+            None => std::env::remove_var("NORA_STORAGE_S3_ANONYMOUS"),
+        }
+        assert!(result.unwrap_err().contains("NORA_STORAGE_S3_ANONYMOUS"));
+    }
 
     #[test]
     fn test_gcs_mode_parses_from_toml_and_env() {

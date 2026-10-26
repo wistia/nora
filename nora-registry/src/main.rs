@@ -2124,6 +2124,7 @@ async fn main() {
                     region = %config.storage.s3_region,
                     has_credentials = config.storage.s3_access_key.is_some(),
                     virtual_hosted = config.storage.s3_virtual_hosted,
+                    anonymous = config.storage.s3_anonymous,
                     "Using S3 storage"
                 );
             }
@@ -2134,6 +2135,7 @@ async fn main() {
                 expose_opt(&config.storage.s3_access_key),
                 expose_opt(&config.storage.s3_secret_key),
                 config.storage.s3_virtual_hosted,
+                config.storage.s3_anonymous,
             )
         }
         StorageMode::Gcs => {
@@ -2357,6 +2359,7 @@ async fn main() {
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    config.storage.s3_anonymous,
                 ),
                 "gcs" => Storage::new_gcs(
                     &config.storage.bucket,
@@ -2378,6 +2381,7 @@ async fn main() {
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    config.storage.s3_anonymous,
                 ),
                 "gcs" => Storage::new_gcs(
                     &config.storage.bucket,

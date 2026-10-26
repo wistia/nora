@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use axum::body::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::{
@@ -15,6 +15,60 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
+
+/// Read only credential settings: ambient endpoint/signing overrides must not
+/// redirect storage or silently turn authentication off. Without an explicit
+/// provider, the builder falls back to EC2 instance-profile credentials.
+fn s3_credentials(
+    mut builder: AmazonS3Builder,
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    anonymous: bool,
+) -> AmazonS3Builder {
+    match (access_key, secret_key) {
+        (Some(ak), Some(sk)) => {
+            assert!(
+                !anonymous,
+                "anonymous S3 access cannot use explicit credentials"
+            );
+            builder.with_access_key_id(ak).with_secret_access_key(sk)
+        }
+        (None, None) if anonymous => builder.with_skip_signature(true),
+        (None, None) => {
+            for (name, key) in [
+                ("AWS_ACCESS_KEY_ID", AmazonS3ConfigKey::AccessKeyId),
+                ("AWS_SECRET_ACCESS_KEY", AmazonS3ConfigKey::SecretAccessKey),
+                ("AWS_SESSION_TOKEN", AmazonS3ConfigKey::Token),
+                (
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    AmazonS3ConfigKey::WebIdentityTokenFile,
+                ),
+                ("AWS_ROLE_ARN", AmazonS3ConfigKey::RoleArn),
+                ("AWS_ROLE_SESSION_NAME", AmazonS3ConfigKey::RoleSessionName),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                    AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
+                ),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    AmazonS3ConfigKey::ContainerCredentialsFullUri,
+                ),
+                (
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                    AmazonS3ConfigKey::ContainerAuthorizationTokenFile,
+                ),
+            ] {
+                if let Ok(value) = std::env::var(name) {
+                    if !value.is_empty() {
+                        builder = builder.with_config(key, value);
+                    }
+                }
+            }
+            builder
+        }
+        _ => panic!("S3 access key and secret key must be set together"),
+    }
+}
 
 /// Downloads stream store -> server -> client under backpressure, so a slow
 /// download client paces the store read. object_store's request timeout covers
@@ -62,7 +116,9 @@ pub struct ObjectStorage {
 }
 
 impl ObjectStorage {
-    /// Create new S3 storage with optional credentials.
+    /// Create S3 storage with explicit credentials or the AWS credential chain
+    /// (environment keys, IRSA, EKS Pod Identity, ECS, then EC2 metadata).
+    /// Unsigned requests require `anonymous = true`.
     ///
     /// `virtual_hosted` selects the request addressing style: `false` (default) appends
     /// the bucket to the endpoint path (`<endpoint>/<bucket>/<key>`); `true` uses the
@@ -76,11 +132,12 @@ impl ObjectStorage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         virtual_hosted: bool,
+        anonymous: bool,
     ) -> Self {
         let url = s3_url.trim_end_matches('/');
         let allow_http = url.starts_with("http://");
 
-        let mut builder = AmazonS3Builder::new()
+        let builder = AmazonS3Builder::new()
             .with_endpoint(url)
             .with_bucket_name(bucket)
             .with_region(region)
@@ -90,14 +147,7 @@ impl ObjectStorage {
             .with_virtual_hosted_style_request(virtual_hosted)
             .with_retry(streaming_retry_config());
 
-        match (access_key, secret_key) {
-            (Some(ak), Some(sk)) => {
-                builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
-            }
-            _ => {
-                builder = builder.with_skip_signature(true);
-            }
-        }
+        let builder = s3_credentials(builder, access_key, secret_key, anonymous);
 
         let store = builder.build().expect("Failed to build S3 client");
 
@@ -614,6 +664,268 @@ mod tests {
     use super::*;
     use sha2::Digest;
 
+    /// Restore even on panic; tests changing process credentials share env_lock.
+    struct AwsEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl AwsEnv {
+        fn clear() -> Self {
+            Self(
+                [
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    "AWS_ROLE_ARN",
+                    "AWS_ROLE_SESSION_NAME",
+                    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                    "AWS_SKIP_SIGNATURE",
+                    "AWS_ENDPOINT_URL_S3",
+                ]
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (name, value)
+                })
+                .collect(),
+            )
+        }
+    }
+
+    impl Drop for AwsEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn s3_signs_ambient_and_explicit_credentials_but_anonymous_is_opt_in() {
+        let _lock = crate::test_env::env_lock();
+        let _env = AwsEnv::clear();
+        // Keep process environment isolated on the test thread while the
+        // independent runtime drives token exchange and storage requests.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                std::env::set_var("AWS_ACCESS_KEY_ID", "ambient-access");
+                std::env::set_var("AWS_SECRET_ACCESS_KEY", "ambient-secret");
+                std::env::set_var("AWS_SESSION_TOKEN", "ambient-token");
+                // Unrelated ambient settings cannot disable signing or redirect S3.
+                std::env::set_var("AWS_SKIP_SIGNATURE", "true");
+                std::env::set_var("AWS_ENDPOINT_URL_S3", "https://wrong.invalid");
+                let server = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(200).insert_header("etag", "\"test\""),
+                    )
+                    .mount(&server)
+                    .await;
+                for (access, secret, anonymous) in [
+                    (None, None, false),
+                    (Some("explicit-access"), Some("explicit-secret"), false),
+                    (None, None, true),
+                ] {
+                    let storage = ObjectStorage::new(
+                        &server.uri(),
+                        "bucket",
+                        "us-east-1",
+                        access,
+                        secret,
+                        false,
+                        anonymous,
+                    );
+                    storage.put("key", b"bytes", "").await.unwrap();
+                }
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 3);
+                assert!(requests[0].headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains("Credential=ambient-access/"));
+                assert_eq!(requests[0].headers["x-amz-security-token"], "ambient-token");
+                assert!(requests[1].headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains("Credential=explicit-access/"));
+                assert!(!requests[1].headers.contains_key("x-amz-security-token"));
+                assert!(!requests[2].headers.contains_key("authorization"));
+                assert!(!requests[2].headers.contains_key("x-amz-security-token"));
+            });
+    }
+
+    #[test]
+    fn s3_pod_identity_reads_authorization_file_and_signs_requests() {
+        let _lock = crate::test_env::env_lock();
+        let _env = AwsEnv::clear();
+        // Keep process environment isolated on the test thread while the
+        // independent runtime drives token exchange and storage requests.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server = wiremock::MockServer::start().await;
+                let dir = tempfile::tempdir().unwrap();
+                let token = dir.path().join("authorization");
+                std::fs::write(&token, "pod-authorization").unwrap();
+                std::env::set_var(
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    format!("{}/credentials", server.uri()),
+                );
+                std::env::set_var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", &token);
+                wiremock::Mock::given(wiremock::matchers::path("/credentials"))
+                    .and(wiremock::matchers::header(
+                        "authorization",
+                        "pod-authorization",
+                    ))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({
+                            "AccessKeyId": "pod-access", "SecretAccessKey": "pod-secret",
+                            "Token": "pod-session", "Expiration": "2100-01-01T00:00:00Z",
+                        }),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                    .and(wiremock::matchers::header(
+                        "x-amz-security-token",
+                        "pod-session",
+                    ))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(200).insert_header("etag", "\"test\""),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let storage = ObjectStorage::new(
+                    &server.uri(),
+                    "bucket",
+                    "us-east-1",
+                    None,
+                    None,
+                    false,
+                    false,
+                );
+                storage.put("key", b"bytes", "").await.unwrap();
+                let requests = server.received_requests().await.unwrap();
+                let put = requests.iter().find(|r| r.method == "PUT").unwrap();
+                assert!(put.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains("Credential=pod-access/"));
+            });
+    }
+
+    /// Intercepts HTTPS at the object_store transport boundary: exercise the real
+    /// token-file reader, STS XML parser, credential refresh and S3 signer without
+    /// live AWS credentials or weakening the STS HTTPS requirement.
+    #[derive(Clone, Debug, Default)]
+    struct MockIrsa(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl object_store::client::HttpConnector for MockIrsa {
+        fn connect(
+            &self,
+            _: &object_store::ClientOptions,
+        ) -> object_store::Result<object_store::client::HttpClient> {
+            Ok(object_store::client::HttpClient::new(self.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl object_store::client::HttpService for MockIrsa {
+        async fn call(
+            &self,
+            req: object_store::client::HttpRequest,
+        ) -> std::result::Result<object_store::client::HttpResponse, object_store::client::HttpError>
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let body = if req.uri().host() == Some("sts.us-east-1.amazonaws.com") {
+                assert_eq!(req.uri().scheme_str(), Some("https"));
+                let url = reqwest::Url::parse(&req.uri().to_string()).unwrap();
+                let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                assert_eq!(query["Action"], "AssumeRoleWithWebIdentity");
+                assert_eq!(query["RoleArn"], "arn:aws:iam::123456789012:role/nora");
+                assert_eq!(query["WebIdentityToken"], "projected-token");
+                let attempt = self.0.fetch_add(1, SeqCst) + 1;
+                // Expired on first use so the next request must refresh.
+                let expires = if attempt == 1 {
+                    "2000-01-01T00:00:00Z"
+                } else {
+                    "2100-01-01T00:00:00Z"
+                };
+                format!("<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>role-access-{attempt}</AccessKeyId><SecretAccessKey>role-secret</SecretAccessKey><SessionToken>role-token-{attempt}</SessionToken><Expiration>{expires}</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>")
+            } else {
+                assert_eq!(req.uri().host(), Some("s3.us-east-1.amazonaws.com"));
+                let attempt = self.0.load(SeqCst);
+                assert!(req.headers()["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains(&format!("Credential=role-access-{attempt}/")));
+                assert_eq!(
+                    req.headers()["x-amz-security-token"].to_str().unwrap(),
+                    format!("role-token-{attempt}")
+                );
+                String::new()
+            };
+            Ok(axum::http::Response::builder()
+                .header("etag", "\"test\"")
+                .body(object_store::client::HttpResponseBody::from(body))
+                .unwrap())
+        }
+    }
+
+    #[test]
+    fn s3_irsa_exchanges_projected_token_signs_and_refreshes_credentials() {
+        let _lock = crate::test_env::env_lock();
+        let _env = AwsEnv::clear();
+        // Keep process environment isolated on the test thread while the
+        // independent runtime drives token exchange and storage requests.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let token = dir.path().join("token");
+                std::fs::write(&token, "projected-token").unwrap();
+                std::env::set_var("AWS_WEB_IDENTITY_TOKEN_FILE", &token);
+                std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/nora");
+                let transport = MockIrsa::default();
+                let store = s3_credentials(
+                    AmazonS3Builder::new()
+                        .with_bucket_name("bucket")
+                        .with_region("us-east-1")
+                        .with_endpoint("https://s3.us-east-1.amazonaws.com")
+                        .with_http_connector(transport.clone()),
+                    None,
+                    None,
+                    false,
+                )
+                .build()
+                .unwrap();
+                for _ in 0..3 {
+                    store
+                        .put(
+                            &Path::from("key"),
+                            object_store::PutPayload::from_static(b"bytes"),
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+            });
+    }
+
     /// A delete answers as the local backend does: an absent object is NotFound, a present one
     /// goes, and one written under the pre-#534 `_at_` encoding goes too. An object store
     /// answers a delete of an absent object with success, which callers took for "deleted".
@@ -678,6 +990,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             false,
+            false,
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -687,7 +1000,7 @@ mod tests {
     /// The true-path is the background refresh loop against a live store.
     #[tokio::test]
     async fn test_health_check_cached_not_live() {
-        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false, true);
         assert!(!storage.health_check().await);
         storage.refresh_reachability().await;
         assert!(!storage.health_check().await);
@@ -712,6 +1025,7 @@ mod tests {
             "us-east-1",
             Some("access"),
             Some("secret"),
+            false,
             false,
         );
         tokio::time::timeout(
@@ -746,6 +1060,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             false,
+            false,
         );
         storage.cached_reachable.store(true, Relaxed);
         storage
@@ -769,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_size_count_leaves_reachability_alone() {
         use std::sync::atomic::Ordering::Relaxed;
-        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false, true);
         storage.cached_reachable.store(true, Relaxed);
         storage
             .last_refresh_unix
@@ -784,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_expires_when_refresh_stalls() {
         use std::sync::atomic::Ordering::Relaxed;
-        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false, true);
         let now = crate::cache_ttl::now_unix();
 
         // A since-dead refresh loop: reachable was true, but the last refresh is ancient.
@@ -868,6 +1183,7 @@ mod tests {
             None,
             None,
             false,
+            true,
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -917,6 +1233,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             virtual_hosted,
+            false,
         );
         assert!(!storage.health_check().await);
         storage.refresh_reachability().await;
@@ -948,6 +1265,7 @@ mod tests {
             "us-east-1",
             Some("access"),
             Some("secret"),
+            false,
             false,
         );
         assert!(!storage

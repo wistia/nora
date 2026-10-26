@@ -1151,6 +1151,11 @@ impl Config {
         }
 
         // 3. Bucket must not be empty when mode = S3 or GCS
+        if self.storage.mode == StorageMode::S3 {
+            if let Err(error) = self.storage.validate_s3_credentials() {
+                errors.push(error);
+            }
+        }
         if matches!(self.storage.mode, StorageMode::S3 | StorageMode::Gcs)
             && self.storage.bucket.trim().is_empty()
         {
@@ -6039,6 +6044,22 @@ proxies = [
     }
 
     #[test]
+    fn s3_startup_rejects_partial_or_anonymous_explicit_credentials() {
+        let _lock = crate::test_env::env_lock();
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::S3;
+        config.storage.s3_access_key = Some(ProtectedString::from("access"));
+        let (_, errors) = config.validate();
+        assert!(errors.iter().any(|e| e.contains("must be set together")));
+        config.storage.s3_secret_key = Some(ProtectedString::from("secret"));
+        config.storage.s3_anonymous = true;
+        let (_, errors) = config.validate();
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("s3_anonymous cannot be combined")));
+    }
+
+    #[test]
     fn test_storage_config_debug_redacts_credentials() {
         let config = StorageConfig {
             mode: StorageMode::Local,
@@ -6051,6 +6072,7 @@ proxies = [
             )),
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         };
