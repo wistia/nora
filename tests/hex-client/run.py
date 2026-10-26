@@ -59,7 +59,7 @@ def main():
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-        def start(label, upstream, public_key=None, offline=False):
+        def start(label, upstream, public_key=None, offline=False, exemptions=None):
             area = scratch / label
             area.mkdir(exist_ok=True)
             port = free_port()
@@ -97,7 +97,7 @@ enabled = false
 [hex]
 proxy = {q(upstream)}
 metadata_ttl = 0
-''' + (f'public_key_file = {q(str(public_key))}\n' if public_key else ""))
+''' + (f'public_key_file = {q(str(public_key))}\n' if public_key else "") + f"[curation.hex]\ncooldown_exempt_packages = {q(exemptions or [])}\n")
             (area / "users").touch()
             env = base | {"NORA_CONFIG_PATH": str(config)}
             if offline:
@@ -175,6 +175,17 @@ metadata_ttl = 0
             proc, mirror = start("young", url, key)
             app("young-locked", mirror, key, locked=True, expected=False)
             app("young-pinned", mirror, key, locked=False, expected=False)
+            stop(proc)
+            proc, mirror = start("nonmatching-exemption", url, key, exemptions=["jason_other"])
+            app("nonmatching-exemption", mirror, key, expected=False)
+            stop(proc)
+            proc, mirror = start("exempt", url, key, exemptions=["jason"])
+            app("young-exempt-locked", mirror, key)
+            app("young-exempt-pinned", mirror, key, locked=False)
+            stop(proc)
+            # Reuse the same Nora storage after removing the exemption.
+            proc, mirror = start("exempt", url, key)
+            app("removed-exemption", mirror, key, expected=False)
             stop(proc)
             upstream.age_days = 8
             proc, mirror = start("mature", url, key)

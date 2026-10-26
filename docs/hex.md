@@ -27,8 +27,30 @@ quarantine_ttl = "7d"
 Set every registry explicitly when using `enable`; it replaces legacy selection.
 Global cooldown settings apply to Hex. `[curation.hex]` supports the standard
 per-registry `min_release_age`, `quarantine` and `quarantine_ttl` overrides.
-Per-package or publisher cooldown exemptions are not implemented. An allowlist
-approval is not a complete exemption from the independent digest quarantine.
+Package cooldown exemptions use exact Hex package names:
+
+```toml
+[curation.hex]
+cooldown_exempt_packages = ["wistia_some_package"]
+```
+
+Listed names are exempt from both release age and digest quarantine for all their
+versions, including when dates are missing or untrusted. Every other package keeps
+the configured cooldown. Wildcards, scopes and publisher/owner matching are not
+supported. Signature, repository identity, checksum, blocklist, allowlist and
+namespace checks remain active. This setting is currently supported only for Hex;
+non-empty exemption lists in other registry sections are configuration errors.
+
+`NORA_CURATION_HEX_COOLDOWN_EXEMPT_PACKAGES` accepts a comma-separated list; an
+empty value clears the list. SIGHUP applies exemption additions/removals to both
+cooldown checks. Removing an exemption restores enforcement for future requests,
+including cached tarballs; it does not change existing digest first-seen records.
+
+Client cooldown is independent of Nora's exemptions. To resolve a young exempt
+package, use `HEX_COOLDOWN=0d`; Nora still enforces the server cooldown on every
+non-exempt package. With client cooldown enabled, Hex may exclude a young exempt
+version before ever requesting its tarball. An allowlist approval alone is not a
+complete exemption from the independent digest quarantine.
 
 Bootstrap Hex before configuring the mirror:
 

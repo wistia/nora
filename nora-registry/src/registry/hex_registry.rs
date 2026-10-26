@@ -372,16 +372,22 @@ async fn tarball(
             .as_deref()
             .or(cfg.quarantine_ttl.as_deref()),
     );
-    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-        &state.digest_store,
-        "hex",
-        &bytes,
-        &mode,
-        ttl,
-        "hexpm",
-        date,
-    ) {
-        return resp;
+    let exempt = state
+        .curation()
+        .curation_engine
+        .cooldown_exempt(RegistryType::Hex, name);
+    if !exempt {
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            &state.digest_store,
+            "hex",
+            &bytes,
+            &mode,
+            ttl,
+            "hexpm",
+            date,
+        ) {
+            return resp;
+        }
     }
     if !from_cache {
         state.repo_index.invalidate("hex");
@@ -444,6 +450,13 @@ mod tests {
         )
     }
     async fn fixture(body: Vec<u8>, trust: bool) -> (MockServer, TestContext) {
+        fixture_with_policy(body, trust, |_| {}).await
+    }
+    async fn fixture_with_policy(
+        body: Vec<u8>,
+        trust: bool,
+        customize: impl FnOnce(&mut crate::config::Config),
+    ) -> (MockServer, TestContext) {
         let up = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/packages/jason"))
@@ -468,6 +481,7 @@ mod tests {
             cfg.server.trust_upstream_dates = trust;
             quarantine_7d(cfg);
             cfg.curation.min_release_age = Some("7d".into());
+            customize(cfg);
         });
         (up, ctx)
     }
@@ -479,6 +493,91 @@ mod tests {
     }
     fn checksum() -> Vec<u8> {
         sha2::Sha256::digest(ARCHIVE).to_vec()
+    }
+
+    #[tokio::test]
+    async fn cooldown_exemption_allows_young_and_dateless_packages_and_cache_hits() {
+        for (date, trust) in [(Some(now()), true), (None, true), (Some(now()), false)] {
+            let (_up, ctx) = fixture_with_policy(record(date, &checksum()), trust, |cfg| {
+                cfg.curation.hex.cooldown_exempt_packages = vec!["jason".into()];
+            })
+            .await;
+            assert_eq!(status(&ctx).await, StatusCode::OK);
+            assert_eq!(status(&ctx).await, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn cooldown_exemption_is_exact_and_preserves_blocklists_and_integrity() {
+        for entry in ["jas", "jason_other"] {
+            let (_up, ctx) = fixture_with_policy(record(Some(now()), &checksum()), true, |cfg| {
+                cfg.curation.hex.cooldown_exempt_packages = vec![entry.into()];
+            })
+            .await;
+            assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+        }
+        let (_dir, blocklist) = crate::test_helpers::blocklist_file("hex", "jason");
+        let (up, ctx) = fixture_with_policy(record(Some(now()), &checksum()), true, |cfg| {
+            cfg.curation.hex.cooldown_exempt_packages = vec!["jason".into()];
+            cfg.curation.blocklist_path = Some(blocklist);
+        })
+        .await;
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+        assert!(upstream_paths(&up).await.is_empty());
+        for body in [record(Some(now()), &[0; 32]), RECORD.to_vec()] {
+            let (_up, ctx) = fixture_with_policy(body, true, |cfg| {
+                cfg.curation.hex.cooldown_exempt_packages = vec!["jason".into()];
+            })
+            .await;
+            assert_eq!(status(&ctx).await, StatusCode::BAD_GATEWAY);
+        }
+    }
+
+    #[tokio::test]
+    async fn cooldown_exemption_preserves_allowlist_restrictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("allowlist.json");
+        std::fs::write(
+            &file,
+            r#"{"version":1,"entries":[{"registry":"hex","name":"other","version":"1.4.4"}]}"#,
+        )
+        .unwrap();
+        let (up, ctx) = fixture_with_policy(record(Some(now()), &checksum()), true, |cfg| {
+            cfg.curation.hex.cooldown_exempt_packages = vec!["jason".into()];
+            cfg.curation.allowlist_path = Some(file.to_str().unwrap().into());
+        })
+        .await;
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+        assert!(upstream_paths(&up).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_exemption_reload_preserves_previous_policy() {
+        let (_up, ctx) = fixture(record(Some(now()), &checksum()), true).await;
+        let (_dir, file) = crate::test_helpers::reload_file(&ctx, |cfg| {
+            cfg.curation.hex.cooldown_exempt_packages = vec!["*".into()];
+        });
+        let result = {
+            let _lock = crate::test_env::env_lock();
+            let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+            crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
+        };
+        assert!(result.is_err());
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cooldown_exemption_reload_skips_existing_hold_and_removal_restores_it() {
+        let (_up, ctx) = fixture(record(None, &checksum()), true).await;
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.hex.cooldown_exempt_packages = vec!["jason".into()];
+        });
+        assert_eq!(status(&ctx).await, StatusCode::OK);
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.hex.cooldown_exempt_packages.clear();
+        });
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
     }
 
     #[test]

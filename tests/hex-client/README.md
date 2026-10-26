@@ -20,7 +20,10 @@ enabled; the script prints the effective Hex configuration.
 Cases: public cold install/compile/run with a seven-day policy; Nora restart and
 fresh-client offline install (including an uncached request proving upstream
 access is disabled); one-day-old locked and pinned releases rejected with 403
-while client cooldown is disabled; eight-day-old release accepted. A controlled
+while client cooldown is disabled; eight-day-old release accepted. Exact exemptions also permit young pinned and
+locked releases; nonmatching exemptions remain blocked, and removing an exemption
+restores blocking against the same persisted cache. Exempt cases disable client
+cooldown while retaining server cooldown for all other names. A controlled
 upstream re-signs the original Jason metadata after changing only publication
 timestamps. Only fixture cases explicitly trust the fixture public key, in their
 isolated Hex homes. No user-global Hex/Mix configuration is changed.

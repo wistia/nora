@@ -1068,6 +1068,8 @@ impl Config {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
 
+        errors.extend(self.curation.cooldown_exemption_errors());
+
         if self.hex.enabled {
             if let Some(path) = &self.hex.public_key_file {
                 use rsa::pkcs8::DecodePublicKey;

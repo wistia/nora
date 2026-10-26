@@ -5062,8 +5062,13 @@ fn reload_curation(
 /// window: the same parse that is checked is the one that is installed.
 ///
 /// In audit/off mode a parse error is logged and the filter dropped (the
-/// engine is advisory there), so this never returns `Err`.
+/// engine is advisory there). Invalid cooldown exemption declarations are refused
+/// in every mode, as at startup.
 fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, String> {
+    let exemption_errors = config.curation.cooldown_exemption_errors();
+    if !exemption_errors.is_empty() {
+        return Err(exemption_errors.join("; "));
+    }
     let enforce = config.curation.mode == CurationMode::Enforce;
     let mut engine = curation::CurationEngine::new(config.curation.clone());
 

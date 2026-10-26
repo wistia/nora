@@ -161,6 +161,17 @@ impl CurationEngine {
         }
     }
 
+    /// A package exemption only disables cooldown gates, never other curation.
+    pub fn cooldown_exempt(&self, registry: RegistryType, name: &str) -> bool {
+        registry == RegistryType::Hex
+            && self
+                .config
+                .hex
+                .cooldown_exempt_packages
+                .iter()
+                .any(|p| p == name)
+    }
+
     /// Add a filter to the end of the chain.
     /// Evaluation order = insertion order.
     pub fn add_filter(&mut self, filter: Box<dyn ProxyFilter>) {
@@ -1891,6 +1902,7 @@ pub struct MinReleaseAgeFilter {
     default: Option<(i64, String)>,
     /// Per-registry thresholds (seconds, label).
     overrides: std::collections::HashMap<RegistryType, (i64, String)>,
+    hex_exempt_packages: std::collections::HashSet<String>,
 }
 
 impl MinReleaseAgeFilter {
@@ -1901,6 +1913,7 @@ impl MinReleaseAgeFilter {
         Self {
             default: Some((min_age_secs, label.to_string())),
             overrides: std::collections::HashMap::new(),
+            hex_exempt_packages: std::collections::HashSet::new(),
         }
     }
 
@@ -1936,8 +1949,11 @@ impl MinReleaseAgeFilter {
                 overrides.insert(rt, threshold);
             }
         }
-        let filter =
-            (default.is_some() || !overrides.is_empty()).then_some(Self { default, overrides });
+        let filter = (default.is_some() || !overrides.is_empty()).then_some(Self {
+            default,
+            overrides,
+            hex_exempt_packages: cfg.hex.cooldown_exempt_packages.iter().cloned().collect(),
+        });
         (filter, problems)
     }
 
@@ -1997,6 +2013,10 @@ impl ProxyFilter for MinReleaseAgeFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
+        if request.registry == RegistryType::Hex && self.hex_exempt_packages.contains(&request.name)
+        {
+            return Decision::Skip;
+        }
         // Resolve the threshold for this registry first: a per-registry override
         // takes precedence over the global default.
         let Some((threshold, label)) = self.threshold(request.registry) else {
@@ -4630,6 +4650,7 @@ mod min_release_age_tests {
                 engine.add_filter(Box::new(Refuse));
                 if global || !own.is_empty() {
                     engine.add_filter(Box::new(MinReleaseAgeFilter {
+                        hex_exempt_packages: std::collections::HashSet::new(),
                         default: global.then(hour),
                         overrides: own.iter().map(|&r| (r, hour())).collect(),
                     }));
