@@ -194,19 +194,28 @@ async fn handle(
             // Quarantine only the .zip module archive (the artifact). The
             // .info/.mod/@v/list/@latest endpoints serve metadata — never gate them.
             if ends_with_ci(&file, ".zip") {
-                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                    state.config.curation.go.quarantine.as_ref().or(state
-                        .config
-                        .curation
-                        .quarantine
-                        .as_ref()),
-                    state.config.curation.go.quarantine_ttl.as_deref().or(state
-                        .config
-                        .curation
-                        .quarantine_ttl
-                        .as_deref()),
-                );
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                let (q_mode, q_secs) = if state
+                    .curation()
+                    .curation_engine
+                    .cooldown_exempt(crate::registry_type::RegistryType::Go, &module_path)
+                {
+                    (crate::digest_quarantine::QuarantineMode::Off, 0)
+                } else {
+                    crate::digest_quarantine::resolve_global(
+                        state.config.curation.go.quarantine.as_ref().or(state
+                            .config
+                            .curation
+                            .quarantine
+                            .as_ref()),
+                        state.config.curation.go.quarantine_ttl.as_deref().or(state
+                            .config
+                            .curation
+                            .quarantine_ttl
+                            .as_deref()),
+                    )
+                };
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                    &state.storage,
                     &state.digest_store,
                     "go",
                     data,
@@ -217,7 +226,9 @@ async fn handle(
                         state.config.server.trust_upstream_dates,
                         publish_date,
                     ),
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
 
@@ -385,19 +396,28 @@ async fn handle(
 
             // Quarantine only the .zip module archive; metadata endpoints pass through.
             if ends_with_ci(&file, ".zip") {
-                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                    state.config.curation.go.quarantine.as_ref().or(state
-                        .config
-                        .curation
-                        .quarantine
-                        .as_ref()),
-                    state.config.curation.go.quarantine_ttl.as_deref().or(state
-                        .config
-                        .curation
-                        .quarantine_ttl
-                        .as_deref()),
-                );
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                let (q_mode, q_secs) = if state
+                    .curation()
+                    .curation_engine
+                    .cooldown_exempt(crate::registry_type::RegistryType::Go, &module_path)
+                {
+                    (crate::digest_quarantine::QuarantineMode::Off, 0)
+                } else {
+                    crate::digest_quarantine::resolve_global(
+                        state.config.curation.go.quarantine.as_ref().or(state
+                            .config
+                            .curation
+                            .quarantine
+                            .as_ref()),
+                        state.config.curation.go.quarantine_ttl.as_deref().or(state
+                            .config
+                            .curation
+                            .quarantine_ttl
+                            .as_deref()),
+                    )
+                };
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                    &state.storage,
                     &state.digest_store,
                     "go",
                     &bytes,
@@ -408,7 +428,9 @@ async fn handle(
                         state.config.server.trust_upstream_dates,
                         publish_date,
                     ),
-                ) {
+                )
+                .await
+                {
                     return resp;
                 }
             }
@@ -1650,5 +1672,64 @@ mod quarantine_first_seen {
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let (_up, ctx) = context(true).await;
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cooldown_prefix_tests {
+    use crate::test_helpers::{create_test_context_with_config, quarantine_7d, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn cooldown_prefix_exemption_preserves_other_policy() {
+        for (name, blocked) in [
+            ("github.com/wistia/pkg", false),
+            ("github.com/wistia-other/pkg", false),
+            ("github.com/wistia/pkg", true),
+        ] {
+            let up = MockServer::start().await;
+            let artifact = format!("/{name}/@v/v1.0.0.zip");
+            Mock::given(method("GET"))
+                .and(path(artifact.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ARTIFACT".to_vec()))
+                .mount(&up)
+                .await;
+            let date = chrono::Utc::now().to_rfc3339();
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}/@v/v1.0.0.info")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"Version":"v1.0.0", "Time":date})),
+                )
+                .mount(&up)
+                .await;
+            let (_dir, blocklist) = crate::test_helpers::blocklist_file("go", name);
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.go.proxy = Some(uri);
+                cfg.server.trust_upstream_dates = true;
+                quarantine_7d(cfg);
+                cfg.curation.min_release_age = Some("7d".into());
+                cfg.curation.go.cooldown_exempt_prefixes = vec!["github.com/wistia/".into()];
+                if blocked {
+                    cfg.curation.blocklist_path = Some(blocklist);
+                }
+            });
+            let expected = if name == "github.com/wistia/pkg" && !blocked {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            let uri = format!("/go{artifact}");
+            for _ in 0..2 {
+                assert_eq!(
+                    send(&ctx.app, Method::GET, &uri, "").await.status(),
+                    expected
+                );
+            }
+        }
     }
 }

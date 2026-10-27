@@ -344,6 +344,27 @@ fn map_err(e: object_store::Error) -> StorageError {
 
 #[async_trait]
 impl StorageBackend for ObjectStorage {
+    async fn create(&self, key: &str, data: &[u8], sha256: &str) -> Result<bool> {
+        let path = Path::from(encode_object_key(key));
+        let opts = PutOptions {
+            mode: object_store::PutMode::Create,
+            attributes: pin_attributes(sha256),
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&path, PutPayload::from(data.to_vec()), opts)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => Ok(false),
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);

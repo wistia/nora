@@ -407,6 +407,105 @@ pub fn proxy_gate_dated(
     }
 }
 
+/// Use one immutable object per digest for cross-replica first-seen state.
+/// A conditional PUT chooses the first writer; all replicas read the winner.
+/// Storage errors or malformed records fail closed in enforce mode. Local storage
+/// keeps the existing JSONL implementation for single-process installations.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_gate_shared(
+    storage: &crate::Storage,
+    local: &DigestStore,
+    registry: &str,
+    bytes: &[u8],
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    upstream: &str,
+    trusted_first_seen: Option<i64>,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    if storage.backend_name() == "local" {
+        return proxy_gate_dated(
+            local,
+            registry,
+            bytes,
+            mode,
+            quarantine_secs,
+            upstream,
+            trusted_first_seen,
+        );
+    }
+    use sha2::Digest;
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+    let key = format!(
+        ".nora-quarantine/{registry}/{}.json",
+        digest.trim_start_matches("sha256:")
+    );
+    let now = Utc::now().timestamp();
+    let result = async {
+        let data = match storage.get(&key).await {
+            Ok(data) => data,
+            Err(crate::storage::StorageError::NotFound) => {
+                let entry = DigestEntry {
+                    registry: registry.to_owned(),
+                    digest: digest.clone(),
+                    first_seen: trusted_first_seen.unwrap_or(now),
+                    upstream: RecordedUrl::new(upstream),
+                };
+                let data = serde_json::to_vec(&entry).map_err(|e| e.to_string())?;
+                storage
+                    .create_internal(&key, &data)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // Always read back, including when this replica lost a concurrent create.
+                storage.get(&key).await.map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let entry: DigestEntry = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
+        if entry.registry != registry || entry.digest != digest || entry.first_seen < 0 {
+            return Err("quarantine record does not match its key".to_owned());
+        }
+        Ok(entry)
+    }
+    .await;
+    let entry = match result {
+        Ok(entry) => entry,
+        Err(error) => {
+            tracing::error!(%registry, %digest, %error, "shared quarantine unavailable");
+            return matches!(mode, QuarantineMode::Enforce).then(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Shared quarantine state unavailable",
+                )
+                    .into_response()
+            });
+        }
+    };
+    let remaining_secs = quarantine_secs.saturating_sub(now.saturating_sub(entry.first_seen));
+    if remaining_secs <= 0 {
+        return None;
+    }
+    let outcome = if matches!(mode, QuarantineMode::Enforce) {
+        "blocked"
+    } else {
+        "observed"
+    };
+    crate::metrics::QUARANTINE_HOLDS_TOTAL
+        .with_label_values(&[registry, outcome])
+        .inc();
+    warn!(%registry, %digest, remaining_secs, %mode, "quarantine: proxy artifact held by shared policy");
+    matches!(mode, QuarantineMode::Enforce).then(|| {
+        quarantine_forbidden(
+            registry,
+            &digest,
+            &QuarantineStatus::Pending { remaining_secs },
+            quarantine_secs,
+        )
+    })
+}
+
 /// Build a generic 403 for a quarantined proxy artifact (non-Docker shape).
 ///
 /// Names the responsible policy (`registry` + `quarantine_ttl_secs` + how much
@@ -1013,5 +1112,215 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shared_tests {
+    use super::*;
+    use sha2::Digest;
+
+    #[tokio::test]
+    async fn shared_quarantine_survives_new_replica_and_concurrent_first_writers() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let a = DigestStore::empty(dir.path().to_str().unwrap());
+        let b = DigestStore::empty(dir.path().to_str().unwrap());
+        let bytes = b"immutable artifact";
+        let now = Utc::now().timestamp();
+        let ttl = 7 * 86400;
+        let (left, right) = tokio::join!(
+            proxy_gate_shared(
+                &storage,
+                &a,
+                "npm",
+                bytes,
+                &QuarantineMode::Enforce,
+                ttl,
+                "upstream",
+                Some(now - ttl - 100)
+            ),
+            proxy_gate_shared(
+                &storage,
+                &b,
+                "npm",
+                bytes,
+                &QuarantineMode::Enforce,
+                ttl,
+                "upstream",
+                Some(now - ttl - 50)
+            ),
+        );
+        assert!(left.is_none() && right.is_none());
+        // No seed and a fresh process-local store still observes the shared matured record.
+        assert!(proxy_gate_shared(
+            &storage,
+            &b,
+            "npm",
+            bytes,
+            &QuarantineMode::Enforce,
+            ttl,
+            "upstream",
+            None
+        )
+        .await
+        .is_none());
+        let keys = storage.list_internal(".nora-quarantine/").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(!dir.path().join("quarantine.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn shared_quarantine_keeps_first_timestamp_and_fails_closed_on_bad_state() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let bytes = b"recent artifact";
+        let ttl = 7 * 86400;
+        let blocked = proxy_gate_shared(
+            &storage,
+            &local,
+            "go",
+            bytes,
+            &QuarantineMode::Enforce,
+            ttl,
+            "upstream",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        // A later replica cannot rewrite the winner with an older upstream seed.
+        let blocked = proxy_gate_shared(
+            &storage,
+            &local,
+            "go",
+            bytes,
+            &QuarantineMode::Enforce,
+            ttl,
+            "upstream",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let digest = hex::encode(sha2::Sha256::digest(bytes));
+        let key = format!(".nora-quarantine/go/{digest}.json");
+        storage.put(&key, b"malformed").await.unwrap();
+        let unavailable = proxy_gate_shared(
+            &storage,
+            &local,
+            "go",
+            bytes,
+            &QuarantineMode::Enforce,
+            ttl,
+            "upstream",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(proxy_gate_shared(
+            &storage,
+            &local,
+            "go",
+            bytes,
+            &QuarantineMode::Off,
+            ttl,
+            "upstream",
+            None
+        )
+        .await
+        .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a disposable loopback MinIO bucket nora-shared-quarantine-test"]
+    fn shared_quarantine_across_independent_s3_clients() {
+        let _lock = crate::test_env::env_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let endpoint =
+                    std::env::var("NORA_TEST_S3_ENDPOINT").expect("set NORA_TEST_S3_ENDPOINT");
+                assert!(endpoint.starts_with("http://127.0.0.1:"));
+                let client = || {
+                    crate::Storage::new_s3(
+                        &endpoint,
+                        "nora-shared-quarantine-test",
+                        "us-east-1",
+                        Some("nora-test"),
+                        Some("nora-test-secret"),
+                        false,
+                        false,
+                    )
+                };
+                let a = client();
+                let b = client();
+                let dir = tempfile::tempdir().unwrap();
+                let local = DigestStore::empty(dir.path().to_str().unwrap());
+                let bytes = uuid::Uuid::new_v4().to_string().into_bytes();
+                let ttl = 7 * 86400;
+                let old = Utc::now().timestamp() - ttl - 100;
+                let (left, right) = tokio::join!(
+                    proxy_gate_shared(
+                        &a,
+                        &local,
+                        "npm",
+                        &bytes,
+                        &QuarantineMode::Enforce,
+                        ttl,
+                        "upstream",
+                        Some(old)
+                    ),
+                    proxy_gate_shared(
+                        &b,
+                        &local,
+                        "npm",
+                        &bytes,
+                        &QuarantineMode::Enforce,
+                        ttl,
+                        "upstream",
+                        Some(old + 50)
+                    ),
+                );
+                assert!(left.is_none() && right.is_none());
+                drop(a);
+                drop(b);
+                assert!(proxy_gate_shared(
+                    &client(),
+                    &local,
+                    "npm",
+                    &bytes,
+                    &QuarantineMode::Enforce,
+                    ttl,
+                    "upstream",
+                    None
+                )
+                .await
+                .is_none());
+                assert!(!dir.path().join("quarantine.jsonl").exists());
+                // Create-if-absent must preserve the winning object through distinct S3 clients.
+                let key = format!(".nora-quarantine/test/{}", uuid::Uuid::new_v4());
+                let (a, b) = (client(), client());
+                let (left, right) =
+                    tokio::join!(a.create_internal(&key, b"a"), b.create_internal(&key, b"b"));
+                assert_ne!(left.unwrap(), right.unwrap());
+            });
+    }
+
+    #[tokio::test]
+    async fn conditional_create_has_exactly_one_winner() {
+        let storage = crate::Storage::in_memory();
+        let (a, b) = tokio::join!(
+            storage.create_internal(".nora-quarantine/test", b"a"),
+            storage.create_internal(".nora-quarantine/test", b"b")
+        );
+        assert_ne!(a.unwrap(), b.unwrap());
+        let winner = storage.get(".nora-quarantine/test").await.unwrap();
+        assert!(winner.as_ref() == b"a" || winner.as_ref() == b"b");
     }
 }

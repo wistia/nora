@@ -602,6 +602,11 @@ pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
 
 #[async_trait::async_trait]
 impl crate::storage::StorageBackend for OpCountingBackend {
+    async fn create(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<bool> {
+        self.counts.hit("create");
+        self.inner.create(key, data, sha256).await
+    }
+
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.counts.hit("put");
         self.inner.put(key, data, sha256).await

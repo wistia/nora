@@ -377,7 +377,8 @@ async fn tarball(
         .curation_engine
         .cooldown_exempt(RegistryType::Hex, name);
     if !exempt {
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            &state.storage,
             &state.digest_store,
             "hex",
             &bytes,
@@ -385,7 +386,9 @@ async fn tarball(
             ttl,
             "hexpm",
             date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
     }
