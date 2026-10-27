@@ -503,7 +503,8 @@ async fn download_gem(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            &state.storage,
             &state.digest_store,
             "gems",
             &data,
@@ -511,7 +512,9 @@ async fn download_gem(
             q_secs,
             "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         let mut response = with_binary(data.to_vec(), "application/octet-stream");
@@ -579,7 +582,8 @@ async fn download_gem(
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                &state.storage,
                 &state.digest_store,
                 "gems",
                 &bytes,
@@ -587,7 +591,9 @@ async fn download_gem(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes, "application/octet-stream")
@@ -657,7 +663,8 @@ async fn download_gemspec(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            &state.storage,
             &state.digest_store,
             "gems",
             &data,
@@ -665,7 +672,9 @@ async fn download_gemspec(
             q_secs,
             "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         return with_binary(data.to_vec(), "application/octet-stream");
@@ -734,7 +743,8 @@ async fn download_gemspec(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                &state.storage,
                 &state.digest_store,
                 "gems",
                 &bytes,
@@ -742,7 +752,9 @@ async fn download_gemspec(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes, "application/octet-stream")

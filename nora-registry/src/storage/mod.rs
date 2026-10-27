@@ -119,6 +119,13 @@ pub trait StorageBackend: Send + Sync {
     /// Store `data` under `key`, pinned to `sha256`. Fails closed: a body whose
     /// pin cannot be recorded is reported as a failed write (#582/#604).
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()>;
+    /// Atomically create an internal record. False means another writer won.
+    /// Backends without conditional writes must fail rather than emulate a racy get/put.
+    async fn create(&self, _key: &str, _data: &[u8], _sha256: &str) -> Result<bool> {
+        Err(StorageError::Network(
+            "conditional create is unsupported by this backend".into(),
+        ))
+    }
     /// Bytes plus the recorded pin, from ONE backend round-trip. `None` means
     /// the object carries no pin (open-world).
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)>;
@@ -232,6 +239,13 @@ pub struct Storage {
 }
 
 impl Storage {
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Self {
+            inner: Arc::new(ObjectStorage::in_memory()),
+        }
+    }
+
     pub fn new_local(path: &str) -> Self {
         Self {
             inner: Arc::new(LocalStorage::new(path)),
@@ -287,6 +301,17 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn holders(&self) -> usize {
         Arc::strong_count(&self.inner)
+    }
+
+    /// Create a small internal coordination record with an integrity pin.
+    pub async fn create_internal(&self, key: &str, data: &[u8]) -> Result<bool> {
+        validate_storage_key(key)?;
+        if !key.starts_with(".nora-") {
+            return Err(StorageError::Network(
+                "conditional records require an internal key".into(),
+            ));
+        }
+        self.inner.create(key, data, &sha256_hex(data)).await
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -1686,6 +1711,7 @@ mod tests {
     /// Every method of `impl Storage` that takes a key or a listing prefix.
     const KEY_METHODS: &[&str] = &[
         "copy",
+        "create_internal",
         "delete",
         "get",
         "get_range",
@@ -1727,6 +1753,10 @@ mod tests {
                 let copy_from = refused(&s.copy(key, "raw/c", None).await);
                 let checks = [
                     ("put", refused(&s.put(key, b"x").await)),
+                    (
+                        "create_internal",
+                        refused(&s.create_internal(key, b"x").await),
+                    ),
                     ("get", refused(&s.get(key).await)),
                     ("get_verified", refused(&s.get_verified(key).await)),
                     ("get_reader", refused(&s.get_reader(key).await)),

@@ -160,6 +160,9 @@ pub struct RegistryCurationOverride {
     /// Only supported for Hex; other registry sections reject non-empty lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_exempt_packages: Vec<String>,
+    /// Literal npm scope or Go module path prefixes, including the trailing slash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldown_exempt_prefixes: Vec<String>,
 }
 
 impl Default for CurationConfig {
@@ -287,6 +290,7 @@ impl CurationConfig {
                 // In the engine a reload builds.
                 min_release_age: _,
                 cooldown_exempt_packages: _,
+                cooldown_exempt_prefixes: _,
                 quarantine,
                 quarantine_ttl,
             } = own;
@@ -331,11 +335,56 @@ impl CurationConfig {
         }
     }
 
+    /// Match cooldown exemptions without bypassing other curation filters.
+    pub fn cooldown_exempt(&self, registry: RegistryType, name: &str) -> bool {
+        let Some(section) = self.registry_override(registry) else {
+            return false;
+        };
+        (registry == RegistryType::Hex
+            && section.cooldown_exempt_packages.iter().any(|p| p == name))
+            || (matches!(registry, RegistryType::Npm | RegistryType::Go)
+                && section
+                    .cooldown_exempt_prefixes
+                    .iter()
+                    .any(|p| !p.is_empty() && p.ends_with('/') && name.starts_with(p)))
+    }
+
     /// Validate exemption declarations at startup and on curation reload.
     pub fn cooldown_exemption_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for &registry in RegistryType::all() {
             if let Some(section) = self.registry_override(registry) {
+                for prefix in &section.cooldown_exempt_prefixes {
+                    let valid = match registry {
+                        RegistryType::Npm => prefix
+                            .strip_prefix('@')
+                            .and_then(|p| p.strip_suffix('/'))
+                            .is_some_and(|scope| {
+                                !scope.is_empty()
+                                    && scope.bytes().all(|b| {
+                                        b.is_ascii_lowercase()
+                                            || b.is_ascii_digit()
+                                            || b"-._~".contains(&b)
+                                    })
+                            }),
+                        RegistryType::Go => {
+                            prefix.ends_with('/')
+                                && prefix.contains('.')
+                                && prefix.split('/').rev().skip(1).all(|part| {
+                                    !part.is_empty()
+                                        && part != "."
+                                        && part != ".."
+                                        && part.bytes().all(|b| {
+                                            b.is_ascii_alphanumeric() || b".-_~".contains(&b)
+                                        })
+                                })
+                        }
+                        _ => false,
+                    };
+                    if !valid {
+                        errors.push(format!("curation.{registry}.cooldown_exempt_prefixes: {prefix:?} must be a literal npm scope or Go module prefix ending in / (npm and go only)"));
+                    }
+                }
                 for name in &section.cooldown_exempt_packages {
                     if registry != RegistryType::Hex {
                         errors.push(format!("curation.{registry}.cooldown_exempt_packages is only supported for hex"));
@@ -491,5 +540,38 @@ impl CurationConfig {
                 Some(format!("{key}=\"{value}\" is not a duration: {error}"))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_prefixes_are_registry_specific_and_bounded() {
+        let mut cfg = CurationConfig::default();
+        cfg.npm.cooldown_exempt_prefixes = vec!["@wistia/".into()];
+        cfg.go.cooldown_exempt_prefixes = vec!["github.com/wistia/".into()];
+        assert!(cfg.cooldown_exemption_errors().is_empty());
+        assert!(cfg.cooldown_exempt(RegistryType::Npm, "@wistia/player"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Npm, "@wistia-other/player"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Gems, "@wistia/player"));
+        assert!(cfg.cooldown_exempt(RegistryType::Go, "github.com/wistia/pkg/v2"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Go, "github.com/wistia-other/pkg"));
+        for bad in ["", "@wistia", "*", "@wistia/*", "@wistia/pkg/"] {
+            cfg.npm.cooldown_exempt_prefixes = vec![bad.into()];
+            assert!(!cfg.cooldown_exemption_errors().is_empty(), "{bad:?}");
+        }
+        cfg.npm.cooldown_exempt_prefixes.clear();
+        for bad in [
+            "",
+            "github.com/wistia",
+            "github.com/*/",
+            "github.com/../",
+            "/",
+        ] {
+            cfg.go.cooldown_exempt_prefixes = vec![bad.into()];
+            assert!(!cfg.cooldown_exemption_errors().is_empty(), "{bad:?}");
+        }
     }
 }
