@@ -1121,6 +1121,21 @@ pub(crate) async fn proxy_fetch_conditional(
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
+    proxy_fetch_conditional_with_cache_control(client, url, timeout, auth, validators, cb, scope)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Conditional fetch that also retains upstream Cache-Control for transparent proxies.
+pub(crate) async fn proxy_fetch_conditional_with_cache_control(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<(Revalidation, Option<String>), ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
     let cb_key = scope.into().key();
     let probe = cb.check(&cb_key)?;
@@ -1138,10 +1153,11 @@ pub(crate) async fn proxy_fetch_conditional(
 
     match request.send().await {
         Ok(response) => {
+            let cache_control = header_string(&response, header::CACHE_CONTROL);
             let status = response.status();
             if status == reqwest::StatusCode::NOT_MODIFIED {
                 cb.record_success(&cb_key, probe);
-                return Ok(Revalidation::NotModified);
+                return Ok((Revalidation::NotModified, cache_control));
             }
             if status.is_success() {
                 let new_validators = Validators {
@@ -1151,10 +1167,13 @@ pub(crate) async fn proxy_fetch_conditional(
                 return match response.bytes().await {
                     Ok(body) => {
                         cb.record_success(&cb_key, probe);
-                        Ok(Revalidation::Modified {
-                            body: body.to_vec(),
-                            validators: new_validators,
-                        })
+                        Ok((
+                            Revalidation::Modified {
+                                body: body.to_vec(),
+                                validators: new_validators,
+                            },
+                            cache_control,
+                        ))
                     }
                     Err(e) => {
                         // 2xx but the body could not be read (e.g. a mid-stream
