@@ -98,7 +98,8 @@ are limited to 100 MiB. Upstream redirects remain on the configured origin.
 ## Interfaces and limits
 
 GET and HEAD: `/hex/packages/{name}`, `/hex/names`, `/hex/versions`,
-`/hex/tarballs/{name}-{version}.tar`, `/hex/public_key`. Publishing/deletion,
+`/hex/tarballs/{name}-{version}.tar`, `/hex/public_key`,
+`/hex/installs/hex-1.x.csv`. Publishing/deletion,
 private `/repos/{organization}`, documentation, installation archives, CLI
 `mirror` and import are not supported. Internal namespace names are never sent
 upstream; this feature provides no locally published Hex packages.
@@ -116,3 +117,24 @@ caches when testing enforcement. See [the real Mix app smoke](../tests/hex-clien
 Protocol sources: [registry v2](https://github.com/hexpm/specifications/blob/main/registry-v2.md),
 [package schema](https://github.com/hexpm/specifications/blob/main/registry/package.proto),
 [Hex public key](https://github.com/hexpm/hex/blob/v2.6.0/lib/hex/repo.ex).
+
+## HTTP caching and client update checks
+
+Successful tarball responses advertise `public, max-age=31536000, immutable`.
+Signed package/listing metadata and the public key advertise
+`public, max-age=60, must-revalidate`. Shared caches can serve successful downloads
+without rerunning Nora policy gates until expiry; invalidate affected tarball paths
+after emergency policy changes. The upstream metadata TTL remains independent of
+these downstream cache lifetimes.
+
+Hex checks for client updates at `/installs/hex-1.x.csv` beneath its mirror URL.
+Nora relays that informational CSV with a 60-second cache lifetime and a 1 MiB
+response limit. For the default `https://repo.hex.pm` upstream, the catalog comes
+from `https://builds.hex.pm` directly, without upstream credentials; this avoids
+the public repository's cross-origin redirect. Custom upstream mirrors must serve
+the catalog themselves. The CSV is not signed registry metadata and is never used
+to approve packages or bypass package verification or cooldown checks.
+
+This supports the update notification, not installation archives or `mix local.hex`:
+provision the Hex client separately in build images. A missing catalog produces a
+nonfatal update-check warning; dependency resolution can still succeed.
