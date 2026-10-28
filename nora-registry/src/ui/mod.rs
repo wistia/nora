@@ -129,6 +129,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/raw/{*name}", get(raw_detail))
         // New registries (v0.7 — generic list pages)
         .route("/ui/gems", get(generic_registry_list))
+        .route("/ui/hex", get(generic_registry_list))
+        .route("/ui/hex/{name}", get(generic_registry_detail))
         .route("/ui/terraform", get(generic_registry_list))
         .route("/ui/ansible", get(ansible_browse_root))
         .route("/ui/ansible/{*path}", get(ansible_browse))
@@ -679,6 +681,7 @@ async fn generic_registry_list(
     let registry_key = uri.path().strip_prefix("/ui/").unwrap_or("raw");
     let title = match crate::registry_type::RegistryType::from_str_opt(registry_key) {
         Some(crate::registry_type::RegistryType::Gems) => "RubyGems",
+        Some(crate::registry_type::RegistryType::Hex) => "Hex.pm",
         Some(crate::registry_type::RegistryType::Terraform) => "Terraform Registry",
         Some(crate::registry_type::RegistryType::Ansible) => "Ansible Galaxy",
         Some(crate::registry_type::RegistryType::Nuget) => "NuGet Gallery",
@@ -1334,5 +1337,32 @@ mod base_path_tests {
         assert!(UiMintRefusal::ScopedCannotMintUnrestricted
             .message()
             .contains("scoped"));
+    }
+}
+
+#[cfg(test)]
+mod hex_route_tests {
+    use crate::test_helpers::send;
+    use axum::http::{Method, StatusCode};
+    #[tokio::test]
+    async fn hex_ui_routes_show_cached_packages() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.hex.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put("hex/tarballs/jason-1.4.4.tar", b"cached gem")
+            .await
+            .unwrap();
+        for route in ["/ui/hex", "/ui/hex/jason"] {
+            let response = send(&ctx.app, Method::GET, route, "").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("Hex.pm"));
+            assert!(html.contains("jason"));
+        }
     }
 }
