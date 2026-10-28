@@ -630,6 +630,15 @@ pub async fn get_npm_detail(
 ) -> PackageDetail {
     let metadata_key = crate::registry::npm::packument_key_for_reading(storage, name).await;
 
+    // One listing supplies cache status and sizes for every version. A HEAD per
+    // packument version makes large package pages painfully slow on S3.
+    let tarballs = format!("npm/{}/tarballs/", name);
+    let stored = storage.list_with_meta(&tarballs).await.unwrap_or_default();
+    let cached_tarballs: std::collections::HashMap<_, _> = stored
+        .iter()
+        .map(|(key, meta)| (key.as_str(), meta))
+        .collect();
+
     let mut stable_versions = Vec::new();
     let mut prerelease_count: usize = 0;
     // Every version the packument names, shown or not, so a stored tarball adds only the rest.
@@ -665,7 +674,7 @@ pub async fn get_npm_detail(
                         }
                     }
 
-                    // Check if tarball is actually cached on disk
+                    // Check the listing for a cached tarball
                     // For scoped packages (@scope/name), tarball uses just the "name" part
                     let name_part = if name.contains('/') {
                         name.rsplit('/').next().unwrap_or(name)
@@ -674,11 +683,12 @@ pub async fn get_npm_detail(
                     };
                     let tarball_key =
                         format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
-                    let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
-                        (meta.size, true)
-                    } else {
-                        (meta_size, false)
-                    };
+                    let (size, cached) =
+                        if let Some(meta) = cached_tarballs.get(tarball_key.as_str()) {
+                            (meta.size, true)
+                        } else {
+                            (meta_size, false)
+                        };
 
                     stable_versions.push(VersionInfo {
                         version: version.clone(),
@@ -694,8 +704,7 @@ pub async fn get_npm_detail(
     // A tarball stored without its packument is a stored version too: a lockfile install
     // fetches tarballs only, and with release dates off no packument is cached. List every
     // stored tarball of this package the packument does not name.
-    let tarballs = format!("npm/{}/tarballs/", name);
-    if let Ok(stored) = storage.list_with_meta(&tarballs).await {
+    {
         let files = stored
             .into_iter()
             .filter_map(|(key, meta)| Some((key.strip_prefix(&tarballs)?.to_string(), meta)));
@@ -1540,6 +1549,13 @@ async fn get_gems_detail(
         .map(|m| format_timestamp(m.modified))
         .unwrap_or_else(|| "N/A".to_string());
 
+    let prefix = format!("gems/gems/{name}-");
+    let stored = storage.list_with_meta(&prefix).await.unwrap_or_default();
+    let cached: std::collections::HashMap<_, _> = stored
+        .iter()
+        .map(|(key, meta)| (key.as_str(), meta))
+        .collect();
+    let mut listed = std::collections::HashSet::new();
     let mut versions = Vec::new();
 
     if let Ok(data) = storage.get(&info_key).await {
@@ -1550,13 +1566,16 @@ async fn get_gems_detail(
                 }
                 // "1.3.0 deps...|checksum:..." — version is first token
                 let version = match line.split_whitespace().next() {
-                    Some(v) if !v.is_empty() => v.to_string(),
+                    Some(v) if v.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+                        v.to_string()
+                    }
                     _ => continue,
                 };
 
+                listed.insert(version.clone());
                 // Check if .gem is cached
                 let gem_key = format!("gems/gems/{}-{}.gem", name, version);
-                let (size, published, cached) = if let Some(meta) = storage.stat(&gem_key).await {
+                let (size, published, cached) = if let Some(meta) = cached.get(gem_key.as_str()) {
                     (meta.size, format_timestamp(meta.modified), true)
                 } else {
                     (0, info_ts.clone(), false)
@@ -1572,8 +1591,42 @@ async fn get_gems_detail(
         }
     }
 
-    // Reverse: newest first (compact index is chronological)
-    versions.reverse();
+    // A lockfile install can cache .gem files without ever fetching /info/name.
+    for (key, meta) in &stored {
+        let Some(stem) = key
+            .strip_prefix("gems/gems/")
+            .and_then(|s| s.strip_suffix(".gem"))
+        else {
+            continue;
+        };
+        if stem.contains('/')
+            || !crate::registry::gems::split_gem_filename(stem)
+                .is_some_and(|(package, _)| package == name)
+        {
+            continue;
+        }
+        let Some(version) = stem.strip_prefix(&format!("{name}-")) else {
+            continue;
+        };
+        if listed.insert(version.to_owned()) {
+            versions.push(VersionInfo {
+                version: version.to_owned(),
+                size: meta.size,
+                published: format_timestamp(meta.modified),
+                cached: true,
+            });
+        }
+    }
+    versions.sort_by(|a, b| {
+        let parts = |v: &str| {
+            v.split(|c: char| !c.is_ascii_digit())
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        };
+        parts(&b.version)
+            .cmp(&parts(&a.version))
+            .then_with(|| b.version.cmp(&a.version))
+    });
     let (versions, prerelease_count, total_stable) =
         apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
@@ -2464,5 +2517,39 @@ mod registry_stats_cover_every_registry {
             .map(|rt| rt.as_str().to_string())
             .collect();
         assert_eq!(keys, names);
+    }
+}
+
+#[cfg(test)]
+mod gems_detail_cache_tests {
+    use super::*;
+    #[tokio::test]
+    async fn gem_only_installs_and_compact_index_merge_without_duplicates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("gems/gems/net-smtp-0.5.2.gem", b"gem")
+            .await
+            .unwrap();
+        storage
+            .put("gems/gems/net-smtp-extra-1.0.0.gem", b"other")
+            .await
+            .unwrap();
+        let detail = get_gems_detail(&storage, "net-smtp", true, true).await;
+        assert_eq!(detail.versions.len(), 1);
+        assert_eq!(detail.versions[0].version, "0.5.2");
+        assert!(detail.versions[0].cached);
+        storage
+            .put(
+                "gems/info/net-smtp",
+                b"created_at: today\n---\n0.5.2 deps|checksum:abc\n0.6.0 deps|checksum:def\n",
+            )
+            .await
+            .unwrap();
+        let detail = get_gems_detail(&storage, "net-smtp", true, true).await;
+        assert_eq!(detail.versions.len(), 2);
+        assert_eq!(detail.versions[0].version, "0.6.0");
+        assert!(!detail.versions[0].cached);
+        assert!(detail.versions[1].cached);
     }
 }
