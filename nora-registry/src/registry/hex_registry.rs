@@ -71,6 +71,7 @@ pub fn routes() -> Router<AppState> {
         .route("/hex/names", get(names))
         .route("/hex/versions", get(versions))
         .route("/hex/public_key", get(public_key))
+        .route("/hex/installs/hex-1.x.csv", get(installs))
 }
 
 fn key_pem(state: &AppState) -> Result<String, StatusCode> {
@@ -220,12 +221,69 @@ async fn metadata(
         Err(_) => Err(StatusCode::BAD_GATEWAY),
     }
 }
-fn binary(bytes: Vec<u8>) -> Response {
-    ([("content-type", "application/octet-stream")], bytes).into_response()
+const METADATA_CACHE_CONTROL: &str = "public, max-age=60, must-revalidate";
+const ARTIFACT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
+fn binary(bytes: Vec<u8>, cache_control: &'static str) -> Response {
+    (
+        [
+            ("content-type", "application/octet-stream"),
+            ("cache-control", cache_control),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+// Informational client-update catalog, not signed package registry metadata.
+// Keep this path fixed rather than exposing a general upstream passthrough.
+async fn installs(State(state): State<AppState>) -> Response {
+    use crate::registry::{proxy_fetch_conditional_bounded, ProxyError, Revalidation, Validators};
+    let Some(upstream) = &state.config.hex.proxy else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // repo.hex.pm redirects this catalog to builds.hex.pm. Select that fixed
+    // public origin explicitly; never follow arbitrary cross-origin redirects
+    // or send a configured mirror's credentials to the public builds service.
+    let public_builds = upstream.trim_end_matches('/') == "https://repo.hex.pm";
+    let catalog_origin = if public_builds {
+        "https://builds.hex.pm"
+    } else {
+        upstream.trim_end_matches('/')
+    };
+    let auth = if public_builds {
+        None
+    } else {
+        crate::secrets::expose_opt(&state.config.hex.proxy_auth).map(UpstreamAuth::Basic)
+    };
+    let url = format!("{catalog_origin}/installs/hex-1.x.csv");
+    match proxy_fetch_conditional_bounded(
+        &state.http_client_same_origin,
+        &url,
+        Duration::from_secs(state.config.hex.proxy_timeout),
+        auth,
+        &Validators::default(),
+        &state.circuit_breaker,
+        RegistryType::Hex,
+        1024 * 1024,
+    )
+    .await
+    {
+        Ok(Revalidation::Modified { body, .. }) => (
+            [
+                ("content-type", "text/plain; charset=utf-8"),
+                ("cache-control", METADATA_CACHE_CONTROL),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 async fn public_key(State(state): State<AppState>) -> Response {
     match key_pem(&state) {
-        Ok(key) => key.into_response(),
+        Ok(key) => ([("cache-control", METADATA_CACHE_CONTROL)], key).into_response(),
         Err(s) => s.into_response(),
     }
 }
@@ -237,7 +295,7 @@ async fn versions(State(state): State<AppState>) -> Response {
 }
 async fn listing(state: &AppState, path: &str) -> Response {
     match metadata(state, path, None, false).await {
-        Ok(b) => binary(b),
+        Ok(b) => binary(b, METADATA_CACHE_CONTROL),
         Err(s) => s.into_response(),
     }
 }
@@ -246,7 +304,7 @@ async fn package(State(state): State<AppState>, Path(name): Path<String>) -> Res
         return StatusCode::BAD_REQUEST.into_response();
     }
     match metadata(&state, &format!("packages/{name}"), Some(&name), false).await {
-        Ok(b) => binary(b),
+        Ok(b) => binary(b, METADATA_CACHE_CONTROL),
         Err(s) => s.into_response(),
     }
 }
@@ -396,7 +454,7 @@ async fn tarball(
         state.repo_index.invalidate("hex");
     }
     state.metrics.record_download("hex");
-    binary(bytes)
+    binary(bytes, ARTIFACT_CACHE_CONTROL)
 }
 
 #[cfg(test)]
@@ -624,11 +682,45 @@ mod tests {
         assert!(verified_payload(&gzip.finish().unwrap(), PUBLIC).is_err());
     }
     #[tokio::test]
+    async fn metadata_and_client_update_catalog_have_short_cache_lifetimes() {
+        let catalog = "2.6.0,checksum,1.20.0\n";
+        let (up, ctx) = fixture(record(Some(now() - 8 * 86400), &checksum()), true).await;
+        Mock::given(method("GET"))
+            .and(path("/installs/hex-1.x.csv"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+            .expect(1)
+            .mount(&up)
+            .await;
+        for route in [
+            "/hex/packages/jason",
+            "/hex/public_key",
+            "/hex/installs/hex-1.x.csv",
+        ] {
+            let response = send(&ctx.app, Method::GET, route, "").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], METADATA_CACHE_CONTROL);
+            if route.ends_with(".csv") {
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "text/plain; charset=utf-8"
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), catalog.as_bytes());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cold_tarball_primes_metadata_and_cached_download_stays_verified() {
         let body = record(Some(now() - 8 * 86400), &checksum());
         let (up, ctx) = fixture(body.clone(), true).await;
-        assert_eq!(status(&ctx).await, StatusCode::OK);
-        assert_eq!(status(&ctx).await, StatusCode::OK);
+        for _ in 0..2 {
+            let response = send(&ctx.app, Method::GET, DOWNLOAD, "").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], ARTIFACT_CACHE_CONTROL);
+        }
         assert_eq!(
             upstream_paths(&up).await,
             vec!["/packages/jason", "/tarballs/jason-1.4.4.tar"]
