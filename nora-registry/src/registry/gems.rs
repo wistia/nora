@@ -83,7 +83,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         if filename == "versions" {
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=3600, must-revalidate"),
+                HeaderValue::from_static("public, max-age=300, must-revalidate"),
             );
         }
         response
@@ -117,17 +117,64 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     };
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), filename);
 
-    match proxy_fetch(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.gems.proxy_timeout),
-        expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
-        &state.circuit_breaker,
-        RegistryType::Gems,
-    )
-    .await
-    {
-        Ok(bytes) => {
+    // Only send validators when the matching cached body is available.
+    let result = if filename == "versions" {
+        let validators = if cached_data.is_some() && state.config.gems.revalidate {
+            read_validators(&state.storage, &storage_key)
+                .await
+                .unwrap_or_default()
+        } else {
+            Validators::default()
+        };
+        proxy_fetch_conditional(
+            &state.http_client,
+            &url,
+            Duration::from_secs(state.config.gems.proxy_timeout),
+            expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
+            &validators,
+            &state.circuit_breaker,
+            RegistryType::Gems,
+        )
+        .await
+    } else {
+        proxy_fetch(
+            &state.http_client,
+            &url,
+            Duration::from_secs(state.config.gems.proxy_timeout),
+            expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
+            &state.circuit_breaker,
+            RegistryType::Gems,
+        )
+        .await
+        .map(|body| Revalidation::Modified {
+            body,
+            validators: Validators::default(),
+        })
+    };
+
+    match result {
+        Ok(Revalidation::NotModified) => {
+            let Some(data) = cached_data else {
+                return StatusCode::BAD_GATEWAY.into_response();
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["gems"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["gems"])
+                .inc_by(data.len() as u64);
+            state.metrics.record_download("gems");
+            state.metrics.record_cache_hit("gems");
+            // Refresh the cache timestamp without downloading the index again.
+            if let Err(e) = state.storage.put(&storage_key, &data).await {
+                tracing::warn!(key = %storage_key, error = ?e, "gems proxy: failed to refresh versions index");
+            }
+            index_response(data.to_vec())
+        }
+        Ok(Revalidation::Modified {
+            body: bytes,
+            validators,
+        }) => {
             state.metrics.record_download("gems");
             state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
@@ -140,8 +187,25 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
-            // Cache in background (overwrite — mutable content)
-            state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
+            if filename == "versions" {
+                // Persist the body before its validators, including empty validators
+                // so an upstream that stops sending them cannot leave old ones behind.
+                match state.storage.put(&storage_key, &bytes).await {
+                    Ok(()) => {
+                        let key = crate::registry::validators_key(&storage_key);
+                        let metadata =
+                            serde_json::to_vec(&validators).expect("serializable validators");
+                        if let Err(e) = state.storage.put(&key, &metadata).await {
+                            tracing::warn!(key = %key, error = ?e, "gems proxy: failed to cache versions validators");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %storage_key, error = ?e, "gems proxy: failed to cache versions index")
+                    }
+                }
+            } else {
+                state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
+            }
             index_response(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -1597,6 +1661,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    use crate::registry::{read_validators, write_validators, Validators};
     use crate::test_helpers::{
         body_bytes, create_test_context_with_config, send, send_with_headers,
     };
@@ -1755,7 +1820,12 @@ mod integration_tests {
         let index = "---\nrails 1.0.0,99.0.0 abc123\n";
         Mock::given(method("GET"))
             .and(path("/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(index)
+                    .insert_header("etag", "\"versions-v1\"")
+                    .insert_header("last-modified", "Wed, 28 Oct 2026 19:58:10 GMT"),
+            )
             .expect(1)
             .mount(&upstream)
             .await;
@@ -1770,6 +1840,118 @@ mod integration_tests {
             "text/plain; charset=utf-8"
         );
         assert_eq!(body_bytes(resp).await.as_ref(), index.as_bytes());
+        let validators = read_validators(&ctx.state.storage, "gems/versions")
+            .await
+            .unwrap();
+        assert_eq!(validators.etag.as_deref(), Some("\"versions-v1\""));
+        assert_eq!(
+            validators.last_modified.as_deref(),
+            Some("Wed, 28 Oct 2026 19:58:10 GMT")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gems_versions_revalidates_with_etag_and_last_modified() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (etag, last_modified) in [(true, false), (false, true), (true, true)] {
+            let upstream = MockServer::start().await;
+            let mut mock = Mock::given(method("GET")).and(path("/versions"));
+            if etag {
+                mock = mock.and(header("if-none-match", "\"v1\""));
+            }
+            if last_modified {
+                mock = mock.and(|request: &wiremock::Request| {
+                    request
+                        .headers
+                        .get("if-modified-since")
+                        .is_some_and(|value| value == "Wed, 28 Oct 2026 19:58:10 GMT")
+                });
+            }
+            mock.respond_with(ResponseTemplate::new(304))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(upstream.uri());
+                cfg.gems.metadata_ttl = 0;
+                cfg.gems.serve_stale = false;
+            });
+            let index = b"---\nrails 1.0.0 abc123\n";
+            ctx.state.storage.put("gems/versions", index).await.unwrap();
+            write_validators(
+                &ctx.state.storage,
+                "gems/versions",
+                &Validators {
+                    etag: etag.then(|| "\"v1\"".to_string()),
+                    last_modified: last_modified
+                        .then(|| "Wed, 28 Oct 2026 19:58:10 GMT".to_string()),
+                },
+            )
+            .await;
+            let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                "public, max-age=300, must-revalidate"
+            );
+            assert_eq!(body_bytes(resp).await.as_ref(), index);
+            upstream.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gems_versions_changed_body_replaces_old_validators() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/versions"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(200).set_body_string("new index"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.metadata_ttl = 0;
+            cfg.gems.serve_stale = false;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", b"old index")
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            "gems/versions",
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), b"new index");
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("gems/versions")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"new index"
+        );
+        assert_eq!(
+            read_validators(&ctx.state.storage, "gems/versions")
+                .await
+                .unwrap(),
+            Validators::default()
+        );
     }
 
     #[tokio::test]
@@ -1797,7 +1979,7 @@ mod integration_tests {
         );
         assert_eq!(
             resp.headers()[header::CACHE_CONTROL],
-            "public, max-age=3600, must-revalidate"
+            "public, max-age=300, must-revalidate"
         );
         assert_eq!(body_bytes(resp).await.as_ref(), index);
     }
