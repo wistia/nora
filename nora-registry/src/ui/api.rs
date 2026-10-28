@@ -2553,3 +2553,32 @@ mod gems_detail_cache_tests {
         assert!(detail.versions[1].cached);
     }
 }
+
+#[cfg(test)]
+mod object_store_detail_tests {
+    use super::*;
+    #[tokio::test]
+    async fn hex_and_gem_details_find_cached_versions_in_object_storage() {
+        let storage = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        storage
+            .put("hex/tarballs/jason-1.4.4.tar", b"archive")
+            .await
+            .unwrap();
+        storage
+            .put("gems/gems/net-smtp-0.5.2.gem", b"gem")
+            .await
+            .unwrap();
+        for (registry, name, version, size) in [
+            ("hex", "jason", "1.4.4", 7),
+            ("gems", "net-smtp", "0.5.2", 3),
+        ] {
+            let detail = get_generic_detail(&storage, registry, name, true, true).await;
+            assert_eq!(detail.versions.len(), 1);
+            assert_eq!(detail.versions[0].version, version);
+            assert_eq!(detail.versions[0].size, size);
+            assert!(detail.versions[0].cached);
+        }
+    }
+}
