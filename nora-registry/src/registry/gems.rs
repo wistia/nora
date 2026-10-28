@@ -7,6 +7,7 @@
 //!   GET /gems/specs.4.8.gz             — full gem index (binary, mutable, TTL cache)
 //!   GET /gems/latest_specs.4.8.gz      — latest gem index (binary, mutable, TTL cache)
 //!   GET /gems/prerelease_specs.4.8.gz  — prerelease index (binary, mutable, TTL cache)
+//!   GET /gems/versions                — compact versions index (text, mutable, TTL cache)
 //!   GET /gems/info/{name}              — compact index (text, mutable, TTL cache)
 //!   GET /gems/gems/{name}-{version}.gem — gem download (binary, immutable cache)
 //!   GET /gems/quick/Marshal.4.8/{name}-{version}.gemspec.rz — gemspec (binary, immutable cache)
@@ -41,6 +42,7 @@ pub fn routes() -> Router<AppState> {
         .route("/gems/latest_specs.4.8.gz", get(latest_specs_index))
         .route("/gems/prerelease_specs.4.8.gz", get(prerelease_specs_index))
         // Compact index (mutable)
+        .route("/gems/versions", get(versions_index))
         .route("/gems/info/{name}", get(compact_index))
         // Gem download (immutable) — wildcard because axum forbids two params per segment
         .route("/gems/gems/{filename}", get(download_gem))
@@ -64,7 +66,28 @@ async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
     fetch_index(&state, "prerelease_specs.4.8.gz").await
 }
 
+// Keep upstream versions and info documents unchanged: their checksums refer to
+// each other. Download gates continue to enforce server-side cooldown policy.
+async fn versions_index(State(state): State<AppState>) -> Response {
+    fetch_index(&state, "versions").await
+}
+
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
+    let content_type = if filename == "versions" {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/gzip"
+    };
+    let index_response = |data: Vec<u8>| {
+        let mut response = with_binary(data, content_type);
+        if filename == "versions" {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=3600, must-revalidate"),
+            );
+        }
+        response
+    };
     let storage_key = format!("gems/{}", filename);
 
     // Eager cache read — preserve data for serve-stale fallback
@@ -80,7 +103,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                     crate::registry_type::RegistryType::Gems,
                     "CACHE",
                 ));
-                return with_binary(data.to_vec(), "application/gzip");
+                return index_response(data.to_vec());
             }
         }
     }
@@ -88,7 +111,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     // Fetch from upstream — none when the operator switched it off: what is stored is all there is.
     let Some(proxy_url) = upstream_url(state) else {
         return match cached_data {
-            Some(data) => with_binary(data.to_vec(), "application/gzip"),
+            Some(data) => index_response(data.to_vec()),
             None => StatusCode::NOT_FOUND.into_response(),
         };
     };
@@ -119,7 +142,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
 
             // Cache in background (overwrite — mutable content)
             state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
-            with_binary(bytes, "application/gzip")
+            index_response(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -135,10 +158,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                     return (
                         StatusCode::OK,
                         [
-                            (
-                                header::CONTENT_TYPE,
-                                HeaderValue::from_static("application/gzip"),
-                            ),
+                            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
                             (
                                 header::CACHE_CONTROL,
                                 HeaderValue::from_static("public, max-age=0, must-revalidate"),
@@ -1725,6 +1745,61 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"gemspec-data");
+    }
+
+    #[tokio::test]
+    async fn test_gems_versions_index_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        let index = "---\nrails 1.0.0,99.0.0 abc123\n";
+        Mock::given(method("GET"))
+            .and(path("/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+        });
+        let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), index.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_gems_cached_versions_index() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.metadata_ttl = 3600;
+        });
+        let index = b"created_at: 2026-10-01T00:00:00Z\n---\nrails 1.0.0,99.0.0 abc123\n";
+        ctx.state.storage.put("gems/versions", index).await.unwrap();
+        // A full 200 response is valid for a Range request too; do not relay
+        // upstream partial bodies or validators for a different representation.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/gems/versions",
+            vec![("range", "bytes=10-")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers()[header::CACHE_CONTROL],
+            "public, max-age=3600, must-revalidate"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), index);
     }
 
     #[tokio::test]
