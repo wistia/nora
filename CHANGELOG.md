@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- Show Hex.pm in the sidebar registry list when Hex is enabled.
+
 ## [1.4.3] - 2026-10-27
 
 ### Added

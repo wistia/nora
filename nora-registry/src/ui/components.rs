@@ -219,6 +219,14 @@ pub fn sidebar_dark_with_registries(
             false,
         ),
         (
+            Some(RegistryType::Hex),
+            "hex",
+            "/ui/hex",
+            "Hex.pm",
+            icons::RAW,
+            false,
+        ),
+        (
             Some(RegistryType::Terraform),
             "terraform",
             "/ui/terraform",
@@ -1112,10 +1120,11 @@ mod tests {
     #[test]
     fn sidebar_lists_only_enabled_registries() {
         let t = get_translations(Lang::En);
-        let set = enabled_set(&[RegistryType::Docker, RegistryType::Npm]);
+        let set = enabled_set(&[RegistryType::Docker, RegistryType::Npm, RegistryType::Hex]);
         let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(&set));
         assert!(html.contains("/ui/docker"), "enabled docker present");
         assert!(html.contains("/ui/npm"), "enabled npm present");
+        assert!(html.contains("/ui/hex"), "enabled hex present");
         assert!(!html.contains("/ui/gems"), "disabled gems absent");
         assert!(!html.contains("/ui/conan"), "disabled conan absent");
         assert!(!html.contains("/ui/rpm"), "disabled rpm absent");
@@ -1134,6 +1143,7 @@ mod tests {
         assert!(html.contains("/ui/rpm"));
         assert!(html.contains("/ui/deb"));
         assert!(html.contains("/ui/docker"));
+        assert!(html.contains("/ui/hex"));
     }
 
     #[test]
@@ -1144,6 +1154,7 @@ mod tests {
         let set: HashSet<RegistryType> = HashSet::new();
         let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(&set));
         assert!(!html.contains("/ui/docker"), "no registry items");
+        assert!(!html.contains("/ui/hex"), "disabled hex absent");
         assert!(
             !html.contains(t.nav_registries),
             "no empty REGISTRIES header"
