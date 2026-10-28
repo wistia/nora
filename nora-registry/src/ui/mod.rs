@@ -1342,7 +1342,6 @@ mod base_path_tests {
 
 #[cfg(test)]
 mod hex_route_tests {
-    use super::*;
     use crate::test_helpers::send;
     use axum::http::{Method, StatusCode};
     #[tokio::test]
