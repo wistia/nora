@@ -438,9 +438,17 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        // ObjectStore prefixes match whole path segments. Our storage interface
+        // also accepts filename prefixes (e.g. hex/tarballs/jason-), so list the
+        // containing directory and apply the exact string prefix below.
         let encoded = encode_object_key(prefix);
-        let prefix_path = Path::from(encoded);
-        let list_prefix = if prefix.is_empty() {
+        let directory = if prefix.ends_with('/') {
+            encoded.as_str()
+        } else {
+            encoded.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+        };
+        let prefix_path = Path::from(directory);
+        let list_prefix = if directory.is_empty() {
             None
         } else {
             Some(&prefix_path)
@@ -459,14 +467,22 @@ impl StorageBackend for ObjectStorage {
             .map(|meta| decode_object_key(meta.location.as_ref()))
             // The signing key is a secret, never an artifact — keep it out of
             // backup/migrate/GC/UI enumeration (see storage::SIGNING_KEY_PREFIX).
-            .filter(|key| !super::is_reserved_signing_key(key))
+            .filter(|key| key.starts_with(prefix) && !super::is_reserved_signing_key(key))
             .collect())
     }
 
     async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        // ObjectStore prefixes match whole path segments. Our storage interface
+        // also accepts filename prefixes (e.g. hex/tarballs/jason-), so list the
+        // containing directory and apply the exact string prefix below.
         let encoded = encode_object_key(prefix);
-        let prefix_path = Path::from(encoded);
-        let list_prefix = if prefix.is_empty() {
+        let directory = if prefix.ends_with('/') {
+            encoded.as_str()
+        } else {
+            encoded.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+        };
+        let prefix_path = Path::from(directory);
+        let list_prefix = if directory.is_empty() {
             None
         } else {
             Some(&prefix_path)
@@ -493,7 +509,7 @@ impl StorageBackend for ObjectStorage {
                     },
                 )
             })
-            .filter(|(key, _)| !super::is_reserved_signing_key(key))
+            .filter(|(key, _)| key.starts_with(prefix) && !super::is_reserved_signing_key(key))
             .collect())
     }
 
@@ -1409,5 +1425,55 @@ mod proptests {
         fn object_key_roundtrip(key in "[a-z0-9@_./-]{1,100}") {
             prop_assert_eq!(decode_object_key(&encode_object_key(&key)), key);
         }
+    }
+}
+
+#[cfg(test)]
+mod filename_prefix_tests {
+    use super::*;
+    #[tokio::test]
+    async fn listings_match_partial_filename_prefixes_and_keep_directory_boundaries() {
+        let store = ObjectStorage::in_memory();
+        for key in [
+            "hex/tarballs/jason-1.4.4.tar",
+            "hex/tarballs/jason-1.4.5.tar",
+            "hex/tarballs/other-1.0.0.tar",
+            "hex/tarballs-extra/jason-1.0.0.tar",
+        ] {
+            store.put(key, b"archive", "").await.unwrap();
+        }
+        let expected = vec![
+            "hex/tarballs/jason-1.4.4.tar",
+            "hex/tarballs/jason-1.4.5.tar",
+        ];
+        let mut keys = store.list("hex/tarballs/jason-").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, expected);
+        let mut meta_keys: Vec<_> = store
+            .list_with_meta("hex/tarballs/jason-")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, meta)| {
+                assert_eq!(meta.size, 7);
+                key
+            })
+            .collect();
+        meta_keys.sort();
+        assert_eq!(meta_keys, expected);
+        assert_eq!(store.list("hex/tarballs/").await.unwrap().len(), 3);
+        assert_eq!(
+            store
+                .list("hex/tarballs/jason-1.4.4.tar")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .list("hex/tarballs/missing-")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
