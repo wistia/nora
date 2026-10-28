@@ -1302,6 +1302,15 @@ pub fn render_package_detail(
             name, base_url
         ),
         Some(RegistryType::Gems) => format!("gem install {} --source {}/gems", name, base_url),
+        Some(RegistryType::Hex) => {
+            let requirement = detail.versions.first()
+                .map(|v| format!("~> {}", v.version))
+                .unwrap_or_else(|| ">= 0.0.0".to_owned());
+            format!(
+                "# Add to the deps list in mix.exs:\n{{:{}, \"{}\"}}\n\nHEX_MIRROR=\"{}/hex\" mix deps.get",
+                name, requirement, base_url.trim_end_matches('/')
+            )
+        },
         Some(RegistryType::Terraform) => format!(
             "# In required_providers block:\n  source = \"{}/terraform/{}\"",
             base_url
@@ -2346,6 +2355,41 @@ mod tests {
         assert!(html.contains("nra_test_token_123"));
         assert!(html.contains("refreshTokens"));
         assert!(html.contains("Copy"));
+    }
+
+    #[test]
+    fn test_hex_install_command() {
+        let mut detail = empty_detail();
+        detail.versions.push(crate::ui::api::VersionInfo {
+            version: "1.4.4".to_owned(),
+            size: 42,
+            published: "N/A".to_owned(),
+            cached: true,
+        });
+        let html = render_package_detail(
+            "hex",
+            "jason",
+            &detail,
+            Lang::En,
+            "https://packages.wistia.cloud/",
+            false,
+        );
+        assert!(html.contains("mix.exs"));
+        assert!(html.contains(&html_escape("{:jason, \"~> 1.4.4\"}")));
+        assert!(html.contains(&html_escape(
+            "HEX_MIRROR=\"https://packages.wistia.cloud/hex\" mix deps.get"
+        )));
+        assert!(!html.contains("cloud//hex"));
+        let html = render_package_detail(
+            "hex",
+            "jason",
+            &empty_detail(),
+            Lang::En,
+            "https://packages.wistia.cloud",
+            false,
+        );
+        assert!(html.contains(&html_escape("{:jason, \">= 0.0.0\"}")));
+        assert!(html.contains("mix deps.get"));
     }
 
     #[test]
