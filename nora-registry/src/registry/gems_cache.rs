@@ -5,7 +5,7 @@
 //! authority; /info objects are shared by checksum, never invalidated by name.
 //! MD5 is the protocol's change identifier, not a security/integrity guarantee.
 
-use super::gems::{fetch_index_with_ttl, read_index_metadata, write_index_metadata, IndexMetadata};
+use super::gems::{fetch_index_with_ttl, read_index_metadata, IndexMetadata};
 use super::{proxy_fetch_conditional_with_cache_control, ProxyError, Revalidation, Validators};
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -14,7 +14,7 @@ use crate::config::UpstreamAuth;
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
 use crate::AppState;
-use axum::body::{to_bytes, Bytes};
+use axum::body::to_bytes;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use md5::{Digest, Md5};
@@ -27,12 +27,26 @@ const MAX_INFO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HOT_ENTRIES: usize = 4096;
 
-#[derive(Default)]
 pub(crate) struct CompactCache {
     snapshot: tokio::sync::Mutex<Option<Snapshot>>,
     hot: parking_lot::Mutex<HotCache>,
     fills: crate::proxy_coalesce::InflightMap<FillOutcome>,
     versions_failure: parking_lot::Mutex<Option<std::time::Instant>>,
+    aliases: parking_lot::Mutex<HashMap<String, AliasEntry>>,
+    alias_permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for CompactCache {
+    fn default() -> Self {
+        Self {
+            snapshot: Default::default(),
+            hot: Default::default(),
+            fills: Default::default(),
+            versions_failure: Default::default(),
+            aliases: Default::default(),
+            alias_permits: Arc::new(tokio::sync::Semaphore::new(MAX_ALIAS_WORKERS)),
+        }
+    }
 }
 
 struct Snapshot {
@@ -51,6 +65,10 @@ struct HotCache {
 struct InfoDocument {
     body: String,
     cache_control: Option<String>,
+    // Older checksum objects did not retain validators. Empty is a safe
+    // migration default: repair must not retain validators for another body.
+    #[serde(default)]
+    validators: Validators,
 }
 
 #[derive(Clone)]
@@ -164,6 +182,21 @@ fn matches_checksum(body: &[u8], checksum: &str) -> bool {
     hex::encode(Md5::digest(body)) == checksum
 }
 
+fn checksum_ttl(state: &AppState, name: &str) -> i64 {
+    if state
+        .curation()
+        .curation_engine
+        .cooldown_exempt(RegistryType::Gems, name)
+    {
+        shorter_ttl(
+            state.config.gems.metadata_ttl,
+            state.config.gems.exempt_metadata_ttl,
+        )
+    } else {
+        state.config.gems.metadata_ttl
+    }
+}
+
 async fn expected_checksum(state: &AppState, name: &str) -> Option<String> {
     expected_checksum_with_refresh(state, name, None).await
 }
@@ -173,18 +206,7 @@ async fn expected_checksum_with_refresh(
     name: &str,
     rejected: Option<&str>,
 ) -> Option<String> {
-    let exempt = state
-        .curation()
-        .curation_engine
-        .cooldown_exempt(RegistryType::Gems, name);
-    let ttl = if exempt {
-        shorter_ttl(
-            state.config.gems.metadata_ttl,
-            state.config.gems.exempt_metadata_ttl,
-        )
-    } else {
-        state.config.gems.metadata_ttl
-    };
+    let ttl = checksum_ttl(state, name);
     // A single refresh per replica, shared by all concurrent /info requests.
     // Cancellation releases the mutex; incomplete snapshots are never published.
     let mut snapshot = state.gems_cache.snapshot.lock().await;
@@ -291,7 +313,10 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
     state.metrics.record_download("gems");
     for attempt in 0..2 {
         match load_info(state, name, &checksum).await {
-            FillOutcome::Ready(document) => return Some(response(&document)),
+            FillOutcome::Ready(document) => {
+                maintain_alias(state, name, &checksum, &document);
+                return Some(response(&document));
+            }
             FillOutcome::ChecksumMismatch => {
                 if attempt == 0 {
                     if let Some(updated) =
@@ -339,6 +364,239 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
         )
             .into_response(),
     )
+}
+
+// Alias health is rebuildable and bounded independently of the body cache.
+// Entries retain only names, hashes and timestamps while idle, never bodies.
+const MAX_ALIAS_WORKERS: usize = 4;
+const ALIAS_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+const ALIAS_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+struct AliasTarget {
+    checksum: String,
+    document: Arc<InfoDocument>,
+}
+
+struct AliasEntry {
+    checksum: String,
+    last_attempt: std::time::Instant,
+    healthy: bool,
+    token: Option<Arc<()>>,
+    pending: Option<AliasTarget>,
+}
+
+// A panic/cancel must not leave a name permanently marked in flight. Compare
+// tokens so dropping an old lease cannot clear a newer worker's state.
+struct AliasLease {
+    cache: Arc<CompactCache>,
+    name: String,
+    token: Arc<()>,
+}
+
+impl Drop for AliasLease {
+    fn drop(&mut self) {
+        let mut aliases = self.cache.aliases.lock();
+        if let Some(entry) = aliases.get_mut(&self.name) {
+            if entry
+                .token
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+            {
+                entry.token = None;
+                entry.pending = None;
+                entry.healthy = false;
+                entry.last_attempt = std::time::Instant::now();
+            }
+        }
+    }
+}
+
+/// Schedule background validation/repair without doing storage I/O on a hot
+/// request. Coalesce by gem name, retain at most one newer target per worker,
+/// and do not spawn an unbounded queue while storage is unavailable.
+fn maintain_alias(state: &AppState, name: &str, checksum: &str, document: &Arc<InfoDocument>) {
+    let ttl = checksum_ttl(state, name);
+    let mut aliases = state.gems_cache.aliases.lock();
+    let check_interval = if ttl > 0 {
+        ALIAS_CHECK_INTERVAL.min(Duration::from_secs(ttl as u64))
+    } else {
+        ALIAS_CHECK_INTERVAL
+    };
+    if let Some(entry) = aliases.get_mut(name) {
+        if entry.token.is_some() {
+            if entry.checksum != checksum {
+                checksum.clone_into(&mut entry.checksum);
+                entry.pending = Some(AliasTarget {
+                    checksum: checksum.to_owned(),
+                    document: Arc::clone(document),
+                });
+            }
+            return;
+        }
+        let interval = if entry.healthy {
+            check_interval
+        } else {
+            ALIAS_RETRY_BACKOFF
+        };
+        if entry.checksum == checksum && entry.last_attempt.elapsed() < interval {
+            return;
+        }
+    }
+    let Ok(permit) = Arc::clone(&state.gems_cache.alias_permits).try_acquire_owned() else {
+        return;
+    };
+    if !aliases.contains_key(name) && aliases.len() >= MAX_HOT_ENTRIES {
+        let Some(oldest) = aliases
+            .iter()
+            .filter(|(_, entry)| entry.token.is_none())
+            .min_by_key(|(_, entry)| entry.last_attempt)
+            .map(|(name, _)| name.clone())
+        else {
+            return;
+        };
+        aliases.remove(&oldest);
+    }
+    let token = Arc::new(());
+    aliases.insert(
+        name.to_owned(),
+        AliasEntry {
+            checksum: checksum.to_owned(),
+            last_attempt: std::time::Instant::now(),
+            healthy: false,
+            token: Some(Arc::clone(&token)),
+            pending: None,
+        },
+    );
+    drop(aliases);
+    let state = state.clone();
+    let name = name.to_owned();
+    let target = AliasTarget {
+        checksum: checksum.to_owned(),
+        document: Arc::clone(document),
+    };
+    let lease = AliasLease {
+        cache: Arc::clone(&state.gems_cache),
+        name: name.clone(),
+        token,
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _lease = lease;
+        let work = async {
+            let mut target = target;
+            loop {
+                let repaired = repair_alias(&state, &name, &target).await;
+                if let Err(error) = &repaired {
+                    tracing::warn!(name, %error, "gems proxy: legacy info alias repair failed");
+                }
+                // If an old in-flight request queued its stale target after a
+                // newer one, recover the current target from hot/shared storage.
+                let latest = if matches!(repaired, Ok(false)) {
+                    latest_alias_target(&state, &name).await
+                } else {
+                    None
+                };
+                let next = {
+                    let mut aliases = state.gems_cache.aliases.lock();
+                    let Some(entry) = aliases.get_mut(&name) else {
+                        return;
+                    };
+                    let pending = entry.pending.take();
+                    if let Some(next) = latest.or(pending) {
+                        entry.checksum.clone_from(&next.checksum);
+                        Some(next)
+                    } else {
+                        entry.token = None;
+                        entry.healthy = repaired.unwrap_or(false);
+                        entry.last_attempt = std::time::Instant::now();
+                        None
+                    }
+                };
+                match next {
+                    Some(next) => target = next,
+                    None => return,
+                }
+            }
+        };
+        tokio::select! { _ = state.cancel_token.cancelled() => {}, _ = work => {} }
+    });
+}
+
+async fn latest_alias_target(state: &AppState, name: &str) -> Option<AliasTarget> {
+    let checksum = state
+        .gems_cache
+        .snapshot
+        .lock()
+        .await
+        .as_ref()?
+        .checksums
+        .get(name)?
+        .clone();
+    let key = format!(".nora-gems-info/{name}/{checksum}");
+    if let Some(document) = state
+        .gems_cache
+        .hot
+        .lock()
+        .get(&key, state.config.gems.info_cache_ttl)
+    {
+        return Some(AliasTarget { checksum, document });
+    }
+    // Repair may outlive a hot entry, but must never fetch upstream by itself.
+    let bytes = state.storage.get(&key).await.ok()?;
+    let document: InfoDocument = serde_json::from_slice(&bytes).ok()?;
+    matches_checksum(document.body.as_bytes(), &checksum).then(|| AliasTarget {
+        checksum,
+        document: Arc::new(document),
+    })
+}
+
+async fn repair_alias(state: &AppState, name: &str, target: &AliasTarget) -> Result<bool, String> {
+    // A completed old fill must not roll back a newer snapshot on this replica.
+    // Release the snapshot lock before storage I/O so hot requests never wait
+    // for an alias PUT. A newer queued target is repaired by the same worker.
+    let current = state
+        .gems_cache
+        .snapshot
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|snapshot| snapshot.checksums.get(name))
+        .cloned();
+    if current.as_deref() != Some(target.checksum.as_str()) {
+        return Ok(false);
+    }
+    let key = format!("gems/info/{name}");
+    let metadata_key = super::validators_key(&key);
+    let (body, metadata) = tokio::join!(state.storage.get(&key), state.storage.get(&metadata_key));
+    let metadata = metadata
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<IndexMetadata>(&bytes).ok());
+    let body_matches = body
+        .as_ref()
+        .is_ok_and(|body| body.as_ref() == target.document.body.as_bytes());
+    let metadata_matches = metadata.as_ref().is_some_and(|metadata| {
+        metadata.validators == target.document.validators
+            && metadata.cache_control == target.document.cache_control
+    });
+    if !body_matches {
+        state
+            .storage
+            .put(&key, target.document.body.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if !body_matches || !metadata_matches {
+        // Pair validators with the body first, and retry metadata failures too.
+        let metadata = IndexMetadata {
+            validators: target.document.validators.clone(),
+            cache_control: target.document.cache_control.clone(),
+        };
+        let bytes = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;
+        let result = state.storage.put(&metadata_key, &bytes).await;
+        state.repo_index.invalidate("gems");
+        result.map_err(|error| error.to_string())?;
+    }
+    Ok(true)
 }
 
 fn record_cache_hit(state: &AppState, name: &str) {
@@ -395,6 +653,7 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
                         InfoDocument {
                             body: String::from_utf8(body.to_vec()).ok()?,
                             cache_control: metadata.cache_control,
+                            validators: metadata.validators,
                         }
                     } else {
                         let url = format!(
@@ -446,24 +705,10 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
                         state
                             .audit
                             .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
-                        // Keep the legacy browsing/date/identity readers working. This mutable
-                        // alias is not used as the checksum cache's freshness authority.
-                        let storage = state.storage.clone();
-                        let repo_index = Arc::clone(&state.repo_index);
-                        let alias_body = Bytes::copy_from_slice(&body);
-                        let metadata = IndexMetadata {
-                            validators,
-                            cache_control: cache_control.clone(),
-                        };
-                        tokio::spawn(async move {
-                            if storage.put(&legacy_key, &alias_body).await.is_ok() {
-                                write_index_metadata(&storage, &legacy_key, &metadata).await;
-                                repo_index.invalidate("gems");
-                            }
-                        });
                         InfoDocument {
                             body: String::from_utf8(body).ok()?,
                             cache_control,
+                            validators,
                         }
                     };
                 // One envelope pairs body and policy atomically across replicas. Keys
@@ -490,6 +735,7 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::registry::gems::write_index_metadata;
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::Method;
     use wiremock::matchers::{method, path};
@@ -875,6 +1121,7 @@ mod tests {
                 Arc::new(InfoDocument {
                     body: "body".into(),
                     cache_control: None,
+                    validators: Validators::default(),
                 }),
             );
         }
@@ -1203,6 +1450,8 @@ mod tests {
             checksum("old")
         );
         assert_eq!(versions_ttl(&ctx.state), 60);
+        assert_eq!(checksum_ttl(&ctx.state, "rails"), 300);
+        assert_eq!(checksum_ttl(&ctx.state, "private_gem"), 60);
         assert_eq!(
             expected_checksum(&ctx.state, "private_gem").await.unwrap(),
             checksum("new")
@@ -1272,6 +1521,321 @@ mod tests {
                 body.as_bytes()
             );
         }
+    }
+
+    async fn wait_for_alias(state: &AppState, name: &str) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let aliases = state.gems_cache.aliases.lock();
+                    if let Some(entry) = aliases.get(name).filter(|entry| entry.token.is_none()) {
+                        return entry.healthy;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_body_and_metadata_alias_writes_repair_from_hot_and_shared_hits() {
+        for obstruct_metadata in [false, true] {
+            for restart in [false, true] {
+                let upstream = MockServer::start().await;
+                let body = "---\n1.0.0 |checksum:abc\n";
+                Mock::given(path("/info/rails"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(body)
+                            .insert_header("cache-control", "max-age=60, public")
+                            .insert_header("etag", "\"rails-v1\"")
+                            .insert_header("last-modified", "Thu, 29 Oct 2026 00:00:00 GMT"),
+                    )
+                    .expect(1)
+                    .mount(&upstream)
+                    .await;
+                let ctx = create_test_context_with_config(|cfg| {
+                    cfg.gems.enabled = true;
+                    cfg.gems.proxy = Some(upstream.uri());
+                    cfg.gems.info_checksum_cache = true;
+                });
+                let alias_key = "gems/info/rails";
+                let metadata_key = super::super::validators_key(alias_key);
+                let obstruction = ctx._tempdir.path().join(if obstruct_metadata {
+                    &metadata_key
+                } else {
+                    alias_key
+                });
+                std::fs::create_dir_all(&obstruction).unwrap();
+                ctx.state
+                    .storage
+                    .put("gems/versions", versions("rails", body).as_bytes())
+                    .await
+                    .unwrap();
+                let result = info(&ctx.state, "rails").await.unwrap();
+                assert_eq!(result.status(), StatusCode::OK);
+                assert_eq!(body_bytes(result).await.as_ref(), body.as_bytes());
+                assert!(!wait_for_alias(&ctx.state, "rails").await);
+                std::fs::remove_dir(&obstruction).unwrap();
+                let mut replica = ctx.state.clone();
+                if restart {
+                    replica.gems_cache = Arc::default();
+                } else {
+                    // Backoff applies to failed repair, not every hot request.
+                    assert!(
+                        replica.gems_cache.aliases.lock()["rails"]
+                            .last_attempt
+                            .elapsed()
+                            < ALIAS_RETRY_BACKOFF
+                    );
+                    replica
+                        .gems_cache
+                        .aliases
+                        .lock()
+                        .get_mut("rails")
+                        .unwrap()
+                        .last_attempt = std::time::Instant::now() - ALIAS_RETRY_BACKOFF;
+                }
+                assert_eq!(
+                    info(&replica, "rails").await.unwrap().status(),
+                    StatusCode::OK
+                );
+                assert!(wait_for_alias(&replica, "rails").await);
+                assert_eq!(
+                    replica.storage.get(alias_key).await.unwrap().as_ref(),
+                    body.as_bytes()
+                );
+                let metadata = read_index_metadata(&replica, alias_key).await;
+                assert_eq!(metadata.validators.etag.as_deref(), Some("\"rails-v1\""));
+                assert_eq!(
+                    metadata.validators.last_modified.as_deref(),
+                    Some("Thu, 29 Oct 2026 00:00:00 GMT")
+                );
+                assert_eq!(
+                    metadata.cache_control.as_deref(),
+                    Some("max-age=60, public")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn old_checksum_envelopes_repair_aliases_and_clear_unbound_validators() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some("http://127.0.0.1:1".into());
+            cfg.gems.info_checksum_cache = true;
+        });
+        let body = "---\n1.0.0\n";
+        let hash = checksum(body);
+        let key = format!(".nora-gems-info/rails/{hash}");
+        let old_envelope = serde_json::json!({"body":body,"cache_control":"max-age=17, public"});
+        ctx.state
+            .storage
+            .put(&key, &serde_json::to_vec(&old_envelope).unwrap())
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", body).as_bytes())
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"wrong body")
+            .await
+            .unwrap();
+        write_index_metadata(
+            &ctx.state.storage,
+            "gems/info/rails",
+            &IndexMetadata {
+                validators: Validators {
+                    etag: Some("\"wrong-body\"".into()),
+                    last_modified: None,
+                },
+                cache_control: Some("max-age=99999".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            info(&ctx.state, "rails").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(wait_for_alias(&ctx.state, "rails").await);
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("gems/info/rails")
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        let metadata = read_index_metadata(&ctx.state, "gems/info/rails").await;
+        assert!(!metadata.validators.is_some());
+        assert_eq!(
+            metadata.cache_control.as_deref(),
+            Some("max-age=17, public")
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_aliases_are_periodically_rechecked_without_checking_every_hit() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.proxy = Some("http://127.0.0.1:1".into());
+        });
+        let body = "index";
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", body).as_bytes())
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("gems/info/rails", body.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            info(&ctx.state, "rails").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(wait_for_alias(&ctx.state, "rails").await);
+        ctx.state.storage.delete("gems/info/rails").await.unwrap();
+        ctx.state
+            .storage
+            .delete("gems/info/rails.meta")
+            .await
+            .unwrap();
+        assert_eq!(
+            info(&ctx.state, "rails").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(ctx.state.storage.get("gems/info/rails").await.is_err());
+        ctx.state
+            .gems_cache
+            .aliases
+            .lock()
+            .get_mut("rails")
+            .unwrap()
+            .last_attempt = std::time::Instant::now() - ALIAS_CHECK_INTERVAL;
+        assert_eq!(
+            info(&ctx.state, "rails").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(wait_for_alias(&ctx.state, "rails").await);
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("gems/info/rails")
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        assert!(ctx.state.storage.get("gems/info/rails.meta").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn alias_workers_are_bounded_and_preserve_the_latest_queued_target() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.proxy = Some("http://127.0.0.1:1".into());
+        });
+        let old_hash = checksum("old");
+        let new_hash = checksum("new");
+        let old = Arc::new(InfoDocument {
+            body: "old".into(),
+            cache_control: None,
+            validators: Validators::default(),
+        });
+        let new = Arc::new(InfoDocument {
+            body: "new".into(),
+            cache_control: Some("max-age=60".into()),
+            validators: Validators::default(),
+        });
+        ctx.state.gems_cache.hot.lock().insert(
+            format!(".nora-gems-info/rails/{new_hash}"),
+            Arc::clone(&new),
+        );
+        // Pausing the snapshot lets many hits race to schedule one background worker.
+        let mut snapshot = ctx.state.gems_cache.snapshot.lock().await;
+        *snapshot = Some(Snapshot {
+            checked_at: now_unix(),
+            forced_at: None,
+            checksums: HashMap::from([("rails".into(), new_hash.clone())]),
+        });
+        for _ in 0..20 {
+            maintain_alias(&ctx.state, "rails", &old_hash, &old);
+        }
+        maintain_alias(&ctx.state, "rails", &new_hash, &new);
+        // A late old request must not erase the newer target permanently.
+        maintain_alias(&ctx.state, "rails", &old_hash, &old);
+        assert_eq!(
+            ctx.state.gems_cache.alias_permits.available_permits(),
+            MAX_ALIAS_WORKERS - 1
+        );
+        assert_eq!(ctx.state.gems_cache.aliases.lock().len(), 1);
+        drop(snapshot);
+        assert!(wait_for_alias(&ctx.state, "rails").await);
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("gems/info/rails")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"new"
+        );
+        assert_eq!(
+            ctx.state.gems_cache.aliases.lock()["rails"].checksum,
+            new_hash
+        );
+        let permits = Arc::clone(&ctx.state.gems_cache.alias_permits)
+            .acquire_many_owned(MAX_ALIAS_WORKERS as u32)
+            .await
+            .unwrap();
+        maintain_alias(&ctx.state, "other_gem", &old_hash, &old);
+        assert!(!ctx
+            .state
+            .gems_cache
+            .aliases
+            .lock()
+            .contains_key("other_gem"));
+        drop(permits);
+    }
+
+    #[test]
+    fn cancelled_alias_leases_release_pending_bodies_and_allow_retry() {
+        let cache = Arc::new(CompactCache::default());
+        let token = Arc::new(());
+        cache.aliases.lock().insert(
+            "rails".into(),
+            AliasEntry {
+                checksum: "hash".into(),
+                last_attempt: std::time::Instant::now(),
+                healthy: true,
+                token: Some(Arc::clone(&token)),
+                pending: Some(AliasTarget {
+                    checksum: "hash".into(),
+                    document: Arc::new(InfoDocument {
+                        body: "body".into(),
+                        cache_control: None,
+                        validators: Validators::default(),
+                    }),
+                }),
+            },
+        );
+        drop(AliasLease {
+            cache: Arc::clone(&cache),
+            name: "rails".into(),
+            token,
+        });
+        let entries = cache.aliases.lock();
+        let entry = &entries["rails"];
+        assert!(entry.token.is_none());
+        assert!(entry.pending.is_none());
+        assert!(!entry.healthy);
     }
 
     #[tokio::test]

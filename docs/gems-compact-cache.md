@@ -54,6 +54,24 @@ gem. The rest of the index remains usable. If the whole index cannot be used,
 Nora backs off refresh attempts for five seconds instead of rereading and
 parsing it for every `/info` request.
 
+The mutable `gems/info/<gem>` alias is still used by browsing and filename
+identity readers. Successful responses offer the alias for background repair,
+including hot hits, shared-object reuse after restart, and legacy migrations.
+Repair checks the body and validator/Cache-Control sidecar together; a partial
+metadata failure is retried too. New checksum envelopes retain validators for
+this purpose. Older envelopes remain readable and safely default to empty
+validators rather than preserving validators for another body.
+
+Alias checks perform no storage I/O on the request path. They are request-driven,
+coalesced per gem, and limited to four workers with at most one pending target
+per active gem. Idle health tracking is bounded to 4,096 entries and retains no
+body buffers. Failed or cancelled repairs can retry on a later hit after five
+seconds. Healthy aliases are rechecked after five minutes, or a shorter positive
+configured checksum interval. If all workers are busy, a later hit can schedule
+the repair instead of building an unbounded queue. A newer queued/current local
+snapshot supersedes an old repair target. The alias remains best-effort mutable
+metadata; checksum-keyed objects remain the authority for cached responses.
+
 If `/versions` cannot be used, or it has no usable entry for a gem, Nora retains
 its previous `/info` TTL/ETag/Last-Modified behavior. Transient `/info` fetch
 failures also honor `serve_stale=true` when an old named body is available,
