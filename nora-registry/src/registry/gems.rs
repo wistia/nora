@@ -592,30 +592,8 @@ async fn download_gem(
     };
     let cached_meta = state.storage.stat(&storage_key).await;
 
-    // Resolved here, not at the serve site, so the range branch below can see it.
-    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-        state.config.curation.gems.quarantine.as_ref().or(state
-            .config
-            .curation
-            .quarantine
-            .as_ref()),
-        state
-            .config
-            .curation
-            .gems
-            .quarantine_ttl
-            .as_deref()
-            .or(state.config.curation.quarantine_ttl.as_deref()),
-    );
-
-    if identities.iter().all(|identity| {
-        state
-            .curation()
-            .curation_engine
-            .cooldown_exempt(RegistryType::Gems, &identity.name)
-    }) {
-        q_mode = crate::digest_quarantine::QuarantineMode::Off;
-    }
+    // Resolve once so cache, upstream and Range responses use the same policy.
+    let (q_mode, q_secs) = effective_quarantine(&state, &identities);
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. .gem files only — the specs/compact indexes are mutable. A
@@ -808,11 +786,13 @@ async fn download_gemspec(
     let GemFileGate {
         internal,
         publish_date,
-        ..
+        identities,
     } = match gem_file_gate(&state, &headers, stem, &storage_key).await {
         Ok(gate) => gate,
         Err(refusal) => return *refusal,
     };
+
+    let (q_mode, q_secs) = effective_quarantine(&state, &identities);
 
     // Immutable cache. get_verified discharges the integrity witness at serve.
     let (cached, read_failure) =
@@ -831,20 +811,6 @@ async fn download_gemspec(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.gems.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .gems
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
         if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
             &state.storage,
             &state.digest_store,
@@ -911,20 +877,6 @@ async fn download_gemspec(
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.gems.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .gems
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
             if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
                 &state.storage,
                 &state.digest_store,
@@ -948,6 +900,40 @@ async fn download_gemspec(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// A gem and its gemspec must apply the same all-identities exemption rule.
+/// Load one curation snapshot so a reload cannot mix exemption sets mid-check.
+fn effective_quarantine(
+    state: &AppState,
+    identities: &[GemFile],
+) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.gems.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .gems
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+
+    let curation = state.curation();
+    if !identities.is_empty()
+        && identities.iter().all(|identity| {
+            curation
+                .curation_engine
+                .cooldown_exempt(RegistryType::Gems, &identity.name)
+        })
+    {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
+    }
+    (q_mode, q_secs)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1759,6 +1745,38 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    #[test]
+    fn quarantine_exemption_requires_every_identity_in_one_curation_snapshot() {
+        use crate::digest_quarantine::QuarantineMode;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+            cfg.curation.gems.cooldown_exempt_packages = vec!["private_gem".into()];
+        });
+        let private = super::GemFile {
+            name: "private_gem".into(),
+            version: "1.0.0".into(),
+            platform: None,
+        };
+        let ordinary = super::GemFile {
+            name: "ordinary_gem".into(),
+            version: "1.0.0".into(),
+            platform: None,
+        };
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, std::slice::from_ref(&private)).0,
+            QuarantineMode::Off
+        ));
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, &[private, ordinary]).0,
+            QuarantineMode::Enforce
+        ));
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, &[]).0,
+            QuarantineMode::Enforce
+        ));
+    }
+
     use super::{write_index_metadata, IndexMetadata};
     use crate::registry::{read_validators, write_validators, Validators};
     use crate::test_helpers::{

@@ -62,7 +62,9 @@ even if its checksum differs from the current snapshot. Such responses carry
 they are never stored under the new checksum. Checksum mismatches are not
 treated as transient fetch failures. Internal namespace gems and offline-only registries continue to use their local copies,
 without consulting upstream `/versions`. Namespace and curation checks run
-before the hot cache is consulted.
+before the hot cache is consulted. Validated upstream fills retain the existing
+proxy-fetch audit/activity events; hot, shared and migrated hits emit cache-hit
+activity events.
 
 ## Configuration
 
@@ -78,7 +80,8 @@ cooldown_exempt_packages = ["my_internal_gem"]
 ```
 
 RubyGems exemptions are exact, case-sensitive package names, not prefixes or
-globs. They bypass release-age and digest-quarantine cooldowns only; blocklists,
+globs. They bypass release-age and digest-quarantine cooldowns for both `.gem`
+and `.gemspec.rz` downloads, on cached and upstream paths. Blocklists,
 allowlists, namespace isolation and integrity checks still apply. Ambiguous gem
 filenames must have every possible identity exempt before digest quarantine is
 skipped. Existing registry-wide `[curation.gems] min_release_age` overrides also

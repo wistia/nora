@@ -7,6 +7,8 @@
 
 use super::gems::{fetch_index_with_ttl, read_index_metadata, write_index_metadata, IndexMetadata};
 use super::{proxy_fetch_conditional_with_cache_control, ProxyError, Revalidation, Validators};
+use crate::activity_log::{ActionType, ActivityEntry};
+use crate::audit::AuditEntry;
 use crate::cache_ttl::{is_within_ttl, now_unix};
 use crate::config::UpstreamAuth;
 use crate::registry_type::RegistryType;
@@ -305,7 +307,7 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
             FillOutcome::TransientFailure => {
                 if state.config.gems.serve_stale {
                     if let Ok(body) = state.storage.get(&format!("gems/info/{name}")).await {
-                        state.metrics.record_cache_hit("gems");
+                        record_cache_hit(state, name);
                         // Serve the old named body only as an explicitly stale response.
                         // It must never be published under the new checksum key.
                         return Some(
@@ -339,11 +341,21 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
     )
 }
 
+fn record_cache_hit(state: &AppState, name: &str) {
+    state.metrics.record_cache_hit("gems");
+    state.activity.push(ActivityEntry::new(
+        ActionType::CacheHit,
+        name.to_owned(),
+        RegistryType::Gems,
+        "CACHE",
+    ));
+}
+
 async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome {
     let key = format!(".nora-gems-info/{name}/{checksum}");
     let ttl = state.config.gems.info_cache_ttl;
     if let Some(document) = state.gems_cache.hot.lock().get(&key, ttl) {
-        state.metrics.record_cache_hit("gems");
+        record_cache_hit(state, name);
         return FillOutcome::Ready(document);
     }
     let document = state
@@ -356,6 +368,7 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
             || async {
                 // Recheck after election; a previous fill may just have finished.
                 if let Some(document) = state.gems_cache.hot.lock().get(&key, ttl) {
+                    record_cache_hit(state, name);
                     return Some(FillOutcome::Ready(document));
                 }
                 if let Ok(bytes) = state.storage.get(&key).await {
@@ -367,7 +380,7 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
                                 .hot
                                 .lock()
                                 .insert(key.clone(), Arc::clone(&document));
-                            state.metrics.record_cache_hit("gems");
+                            record_cache_hit(state, name);
                             return Some(FillOutcome::Ready(document));
                         }
                     }
@@ -378,6 +391,7 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
                 let document =
                     if let Some(body) = legacy.filter(|body| matches_checksum(body, checksum)) {
                         let metadata = read_index_metadata(state, &legacy_key).await;
+                        record_cache_hit(state, name);
                         InfoDocument {
                             body: String::from_utf8(body.to_vec()).ok()?,
                             cache_control: metadata.cache_control,
@@ -423,6 +437,15 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
                             return Some(FillOutcome::ChecksumMismatch);
                         }
                         state.metrics.record_cache_miss("gems");
+                        state.activity.push(ActivityEntry::new(
+                            ActionType::ProxyFetch,
+                            name.to_owned(),
+                            RegistryType::Gems,
+                            "PROXY",
+                        ));
+                        state
+                            .audit
+                            .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
                         // Keep the legacy browsing/date/identity readers working. This mutable
                         // alias is not used as the checksum cache's freshness authority.
                         let storage = state.storage.clone();
@@ -1252,6 +1275,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checksum_fetch_and_cache_hits_preserve_audit_and_activity_events() {
+        let upstream = MockServer::start().await;
+        let body = "---\n1.0.0\n";
+        Mock::given(path("/info/rails"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+            cfg.audit.mode = crate::audit::AuditMode::File;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", body).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            info(&ctx.state, "rails").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            info(&ctx.state, "rails").await.unwrap().status(),
+            StatusCode::OK
+        ); // hot
+        let mut replica = ctx.state.clone();
+        replica.gems_cache = Arc::default();
+        assert_eq!(
+            info(&replica, "rails").await.unwrap().status(),
+            StatusCode::OK
+        ); // shared
+        let activity = ctx.state.activity.all();
+        let gem_activity: Vec<_> = activity
+            .iter()
+            .filter(|event| event.artifact == "rails")
+            .collect();
+        assert_eq!(
+            gem_activity
+                .iter()
+                .filter(|event| event.action == ActionType::ProxyFetch && event.source == "PROXY")
+                .count(),
+            1
+        );
+        assert_eq!(
+            gem_activity
+                .iter()
+                .filter(|event| event.action == ActionType::CacheHit && event.source == "CACHE")
+                .count(),
+            2
+        );
+        ctx.state.audit.shutdown().await;
+        let audit = std::fs::read_to_string(ctx.state.audit.path()).unwrap();
+        let events: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["action"] == "proxy_fetch" && event["registry"] == "gems")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn gemspec_cooldown_exemptions_cover_cold_cache_and_reload_paths() {
+        use crate::digest_quarantine::QuarantineMode;
+        let upstream = MockServer::start().await;
+        for name in ["private_gem", "ordinary_gem"] {
+            Mock::given(path(format!("/quick/Marshal.4.8/{name}-1.0.0.gemspec.rz")))
+                .respond_with(ResponseTemplate::new(200).set_body_string("gemspec"))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+        }
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".into());
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+            cfg.curation.gems.cooldown_exempt_packages = vec!["private_gem".into()];
+        });
+        for (name, expected) in [
+            ("private_gem", StatusCode::OK),
+            ("ordinary_gem", StatusCode::FORBIDDEN),
+        ] {
+            let route = format!("/gems/quick/Marshal.4.8/{name}-1.0.0.gemspec.rz");
+            let key = format!("gems/quick/Marshal.4.8/{name}-1.0.0.gemspec.rz");
+            assert_eq!(
+                send(&ctx.app, Method::GET, &route, "").await.status(),
+                expected
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if ctx.state.storage.get(&key).await.is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                send(&ctx.app, Method::GET, &route, "").await.status(),
+                expected
+            );
+        }
+        let mut updated = (*ctx.state.config).clone();
+        updated.curation.gems.cooldown_exempt_packages.clear();
+        ctx.state
+            .reloadable
+            .store(Arc::new(crate::ReloadableConfig {
+                curation_engine: crate::build_curation_engine(&updated).unwrap(),
+                bypass_token: None,
+            }));
+        let route = "/gems/quick/Marshal.4.8/private_gem-1.0.0.gemspec.rz";
+        assert_eq!(
+            send(&ctx.app, Method::GET, route, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        ctx.state
+            .reloadable
+            .store(Arc::new(crate::ReloadableConfig {
+                curation_engine: crate::build_curation_engine(&ctx.state.config).unwrap(),
+                bypass_token: None,
+            }));
+        assert_eq!(
+            send(&ctx.app, Method::GET, route, "").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
     async fn ruby_gem_exemption_skips_cooldown_but_not_a_blocklist() {
         let dir = tempfile::tempdir().unwrap();
         let blocklist = dir.path().join("blocked.json");
@@ -1273,6 +1434,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+        for (name, expected) in [
+            ("private_gem", StatusCode::OK),
+            ("ordinary_gem", StatusCode::FORBIDDEN),
+            ("blocked_gem", StatusCode::FORBIDDEN),
+        ] {
+            ctx.state
+                .storage
+                .put(
+                    &format!("gems/quick/Marshal.4.8/{name}-1.0.0.gemspec.rz"),
+                    b"gemspec",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                send(
+                    &ctx.app,
+                    Method::GET,
+                    &format!("/gems/quick/Marshal.4.8/{name}-1.0.0.gemspec.rz"),
+                    ""
+                )
+                .await
+                .status(),
+                expected
+            );
+        }
+
         assert_eq!(
             send(
                 &ctx.app,
