@@ -736,14 +736,7 @@ async fn generic_registry_detail(
         .and_then(|s| s.split('/').next())
         .unwrap_or("raw");
 
-    let detail = get_generic_detail(
-        &state.storage,
-        registry_key,
-        &name,
-        show_prerelease,
-        show_all,
-    )
-    .await;
+    let detail = get_generic_detail(&state, registry_key, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         registry_key,
         &name,
@@ -912,14 +905,8 @@ async fn ansible_browse(
             let show_prerelease = query.prerelease.unwrap_or(false);
             let show_all = query.all.unwrap_or(false);
             let full_name = format!("{}.{}", segments[0], segments[1]);
-            let detail = get_generic_detail(
-                &state.storage,
-                "ansible",
-                &full_name,
-                show_prerelease,
-                show_all,
-            )
-            .await;
+            let detail =
+                get_generic_detail(&state, "ansible", &full_name, show_prerelease, show_all).await;
             Html(render_package_detail(
                 "ansible",
                 &full_name,

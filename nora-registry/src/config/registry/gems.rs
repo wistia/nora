@@ -20,6 +20,15 @@ pub struct GemsConfig {
     pub proxy_timeout: u64,
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Share checksum-keyed compact-index bodies between replicas; hot reads stay in memory.
+    #[serde(default = "super::super::default_true")]
+    pub info_checksum_cache: bool,
+    /// Refresh /versions more frequently when cooldown-exempt gems are configured.
+    #[serde(default = "default_exempt_metadata_ttl")]
+    pub exempt_metadata_ttl: i64,
+    /// Maximum residence time in the bounded per-process /info body cache.
+    #[serde(default = "default_info_cache_ttl")]
+    pub info_cache_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
     /// Revalidate stale compact-index metadata with a conditional request
@@ -28,6 +37,13 @@ pub struct GemsConfig {
     /// compact-index endpoints support validators, so a 304 avoids the download.
     #[serde(default = "super::super::default_true")]
     pub revalidate: bool,
+}
+
+fn default_exempt_metadata_ttl() -> i64 {
+    60
+}
+fn default_info_cache_ttl() -> i64 {
+    86400
 }
 
 fn default_gems_proxy() -> Option<String> {
@@ -42,6 +58,9 @@ impl Default for GemsConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,
+            info_checksum_cache: true,
+            exempt_metadata_ttl: default_exempt_metadata_ttl(),
+            info_cache_ttl: default_info_cache_ttl(),
             serve_stale: true,
             revalidate: true,
         }
@@ -68,6 +87,23 @@ impl GemsConfig {
         }
         if let Ok(val) = env::var("NORA_GEMS_METADATA_TTL") {
             super::super::parse_env_warn("NORA_GEMS_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_GEMS_INFO_CHECKSUM_CACHE") {
+            self.info_checksum_cache = val == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_GEMS_EXEMPT_METADATA_TTL") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_EXEMPT_METADATA_TTL",
+                &val,
+                &mut self.exempt_metadata_ttl,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_INFO_CACHE_TTL") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_INFO_CACHE_TTL",
+                &val,
+                &mut self.info_cache_ttl,
+            );
         }
         if let Ok(val) = env::var("NORA_GEMS_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");

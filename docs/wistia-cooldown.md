@@ -35,3 +35,10 @@ restores both gates. Existing exact-name Hex exemptions are unchanged.
 The object storage backend must support atomic create-if-absent writes (S3
 `If-None-Match: *`). Unsupported conditional writes fail closed. Coordination
 records are hidden from ordinary registry listings and garbage collection.
+
+RubyGems also accepts exact package-name exemptions through
+`[curation.gems] cooldown_exempt_packages = ["my_internal_gem"]` or
+`NORA_CURATION_GEMS_COOLDOWN_EXEMPT_PACKAGES`. These are case-sensitive names,
+not prefixes. See [RubyGems compact-index caching](gems-compact-cache.md) for the
+shorter checksum refresh interval used for exempt gems and the shared,
+checksum-keyed `/info` body cache.

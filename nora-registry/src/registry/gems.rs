@@ -37,14 +37,14 @@ use std::time::Duration;
 
 // Extend the existing validator sidecar; old sidecars remain readable.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-struct IndexMetadata {
+pub(super) struct IndexMetadata {
     #[serde(flatten)]
-    validators: Validators,
+    pub(super) validators: Validators,
     #[serde(default)]
-    cache_control: Option<String>,
+    pub(super) cache_control: Option<String>,
 }
 
-async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
+pub(super) async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
     let key = crate::registry::validators_key(key);
     state
         .storage
@@ -55,7 +55,11 @@ async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
         .unwrap_or_default()
 }
 
-async fn write_index_metadata(storage: &crate::Storage, key: &str, metadata: &IndexMetadata) {
+pub(super) async fn write_index_metadata(
+    storage: &crate::Storage,
+    key: &str,
+    metadata: &IndexMetadata,
+) {
     if let Ok(bytes) = serde_json::to_vec(metadata) {
         let key = crate::registry::validators_key(key);
         if let Err(e) = storage.put(&key, &bytes).await {
@@ -106,10 +110,14 @@ async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
 // Keep upstream versions and info documents unchanged: their checksums refer to
 // each other. Download gates continue to enforce server-side cooldown policy.
 async fn versions_index(State(state): State<AppState>) -> Response {
-    fetch_index(&state, "versions").await
+    fetch_index_with_ttl(&state, "versions", super::gems_cache::versions_ttl(&state)).await
 }
 
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
+    fetch_index_with_ttl(state, filename, state.config.gems.metadata_ttl).await
+}
+
+pub(super) async fn fetch_index_with_ttl(state: &AppState, filename: &str, ttl: i64) -> Response {
     let content_type = if filename == "versions" {
         "text/plain; charset=utf-8"
     } else {
@@ -134,7 +142,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     let cached_data = cached_data.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
+            if is_within_ttl(meta.modified, ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit("gems");
                 state.activity.push(ActivityEntry::new(
@@ -329,6 +337,12 @@ async fn compact_index(
         }
     }
 
+    if !internal && upstream_url(&state).is_some() && state.config.gems.info_checksum_cache {
+        if let Some(response) = super::gems_cache::info(&state, &name).await {
+            return response;
+        }
+    }
+
     let storage_key = format!("gems/info/{}", name);
 
     // Eager cache read — preserve data for serve-stale fallback
@@ -380,6 +394,11 @@ async fn compact_index(
                 with_text(data.to_vec()),
                 metadata.cache_control.as_deref(),
             ),
+            None if !internal && state.config.gems.info_checksum_cache => {
+                super::gems_cache::offline_info(&state, &name)
+                    .await
+                    .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         };
     };
@@ -578,21 +597,8 @@ async fn download_gem(
     };
     let cached_meta = state.storage.stat(&storage_key).await;
 
-    // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-        state.config.curation.gems.quarantine.as_ref().or(state
-            .config
-            .curation
-            .quarantine
-            .as_ref()),
-        state
-            .config
-            .curation
-            .gems
-            .quarantine_ttl
-            .as_deref()
-            .or(state.config.curation.quarantine_ttl.as_deref()),
-    );
+    // Resolve once so cache, upstream and Range responses use the same policy.
+    let (q_mode, q_secs) = effective_quarantine(&state, &identities);
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. .gem files only — the specs/compact indexes are mutable. A
@@ -785,11 +791,13 @@ async fn download_gemspec(
     let GemFileGate {
         internal,
         publish_date,
-        ..
+        identities,
     } = match gem_file_gate(&state, &headers, stem, &storage_key).await {
         Ok(gate) => gate,
         Err(refusal) => return *refusal,
     };
+
+    let (q_mode, q_secs) = effective_quarantine(&state, &identities);
 
     // Immutable cache. get_verified discharges the integrity witness at serve.
     let (cached, read_failure) =
@@ -808,20 +816,6 @@ async fn download_gemspec(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.gems.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .gems
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
         if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
             &state.storage,
             &state.digest_store,
@@ -888,20 +882,6 @@ async fn download_gemspec(
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.gems.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .gems
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
             if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
                 &state.storage,
                 &state.digest_store,
@@ -925,6 +905,40 @@ async fn download_gemspec(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// A gem and its gemspec must apply the same all-identities exemption rule.
+/// Load one curation snapshot so a reload cannot mix exemption sets mid-check.
+fn effective_quarantine(
+    state: &AppState,
+    identities: &[GemFile],
+) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.gems.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .gems
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+
+    let curation = state.curation();
+    if !identities.is_empty()
+        && identities.iter().all(|identity| {
+            curation
+                .curation_engine
+                .cooldown_exempt(RegistryType::Gems, &identity.name)
+        })
+    {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
+    }
+    (q_mode, q_secs)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1431,38 +1445,63 @@ pub fn split_gem_filename(stem: &str) -> Option<(String, String)> {
 /// Whether a compact index (`/info/<name>`) lists a reading: its rows after `---` start with
 /// `version` or `version-platform` (rubygems `resolver/api_set/gem_parser.rb` splits that
 /// field at its first `-`).
-fn compact_index_lists(index: &str, file: &GemFile) -> bool {
-    let wanted = match &file.platform {
-        Some(platform) => format!("{}-{}", file.version, platform),
-        None => file.version.clone(),
-    };
-    let lines: Vec<&str> = index.lines().collect();
-    let rows = match lines.iter().position(|line| *line == "---") {
-        Some(header) => &lines[header + 1..],
-        None => &lines[..],
-    };
-    rows.iter()
-        .any(|row| row.split(' ').next() == Some(wanted.as_str()))
+fn compact_index_lists(versions: &std::collections::HashSet<String>, file: &GemFile) -> bool {
+    let wanted = file.platform.as_ref().map_or_else(
+        || file.version.clone(),
+        |platform| format!("{}-{platform}", file.version),
+    );
+    versions.contains(&wanted)
 }
 
 /// The readings of a gem file name curation decides on. One reading is the file. Of several,
-/// those the compact index NORA holds for their gem lists (`gems/info/<name>`: upstream's own
+/// those the checksum-selected compact index NORA holds for their gem lists (upstream's own
 /// record of which versions and platforms exist; RubyGems gives a file name to one gem only,
 /// so a listed reading is the file) — and every reading while none is listed.
-async fn gem_file_identities(state: &AppState, readings: Vec<GemFile>) -> Vec<GemFile> {
+pub(super) async fn gem_file_identities(state: &AppState, readings: Vec<GemFile>) -> Vec<GemFile> {
     if readings.len() < 2 {
+        return readings;
+    }
+    use futures::StreamExt;
+    let names: std::collections::HashSet<_> = readings
+        .iter()
+        .map(|reading| reading.name.clone())
+        .collect();
+    let indexes: std::collections::HashMap<_, _> = futures::stream::iter(names)
+        .map(|name| async move {
+            let versions = match super::gems_cache::cached_info(state, &name).await {
+                super::gems_cache::CachedInfo::Managed {
+                    document: Some(document),
+                    fresh: true,
+                    ..
+                } => (Some(document.versions().clone()), false),
+                super::gems_cache::CachedInfo::Managed { .. } => (None, true), // unknown/stale: weigh every possible identity
+                super::gems_cache::CachedInfo::Legacy => (
+                    state
+                        .storage
+                        .get(&format!("gems/info/{name}"))
+                        .await
+                        .ok()
+                        .map(|body| {
+                            super::gems_cache::version_tokens(&String::from_utf8_lossy(&body))
+                        }),
+                    false,
+                ),
+            };
+            (name, versions)
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    if indexes.values().any(|(_, unresolved)| *unresolved) {
         return readings;
     }
     let mut listed = Vec::new();
     for reading in &readings {
-        let Ok(index) = state
-            .storage
-            .get(&format!("gems/info/{}", reading.name))
-            .await
-        else {
-            continue;
-        };
-        if compact_index_lists(&String::from_utf8_lossy(&index), reading) {
+        if indexes
+            .get(&reading.name)
+            .and_then(|(versions, _)| versions.as_ref())
+            .is_some_and(|versions| compact_index_lists(versions, reading))
+        {
             listed.push(reading.clone());
         }
     }
@@ -1610,7 +1649,7 @@ const GEM_FILE_STEM_MAX: usize = GEM_NAME_MAX + 1 + GEM_VERSION_MAX + 1 + GEM_NA
 
 /// Validate gem name: alphanumeric, hyphens, underscores, dots.
 /// No path traversal, no slashes, no null bytes.
-fn is_valid_gem_name(name: &str) -> bool {
+pub(super) fn is_valid_gem_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= GEM_NAME_MAX
         && !name.contains('/')
@@ -1736,6 +1775,38 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    #[test]
+    fn quarantine_exemption_requires_every_identity_in_one_curation_snapshot() {
+        use crate::digest_quarantine::QuarantineMode;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+            cfg.curation.gems.cooldown_exempt_packages = vec!["private_gem".into()];
+        });
+        let private = super::GemFile {
+            name: "private_gem".into(),
+            version: "1.0.0".into(),
+            platform: None,
+        };
+        let ordinary = super::GemFile {
+            name: "ordinary_gem".into(),
+            version: "1.0.0".into(),
+            platform: None,
+        };
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, std::slice::from_ref(&private)).0,
+            QuarantineMode::Off
+        ));
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, &[private, ordinary]).0,
+            QuarantineMode::Enforce
+        ));
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, &[]).0,
+            QuarantineMode::Enforce
+        ));
+    }
+
     use super::{write_index_metadata, IndexMetadata};
     use crate::registry::{read_validators, write_validators, Validators};
     use crate::test_helpers::{
@@ -2499,7 +2570,7 @@ mod platform_gem_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gem_file_names_per_rubygems {
-    use super::{compact_index_lists, gem_file_readings, GemFile};
+    use super::{compact_index_lists_text as compact_index_lists, gem_file_readings, GemFile};
     use proptest::prelude::*;
 
     fn file(name: &str, version: &str, platform: Option<&str>) -> GemFile {
@@ -2987,7 +3058,7 @@ mod gem_file_identity_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gem_file_every_reading_counts {
-    use super::{compact_index_lists, GemFile};
+    use super::{compact_index_lists_text as compact_index_lists, GemFile};
     use crate::test_helpers::{create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::any;
@@ -3722,4 +3793,9 @@ mod gem_file_name_work {
             );
         }
     }
+}
+
+#[cfg(test)]
+fn compact_index_lists_text(index: &str, file: &GemFile) -> bool {
+    compact_index_lists(&super::gems_cache::version_tokens(index), file)
 }
