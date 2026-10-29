@@ -84,7 +84,7 @@ pub fn routes() -> Router<AppState> {
         .route("/gems/prerelease_specs.4.8.gz", get(prerelease_specs_index))
         // Compact index (mutable)
         .route("/gems/versions", get(versions_index))
-        .route("/gems/info/{name}", get(compact_index))
+        .route("/gems/info/{name}", get(compact_index_with_cache_policy))
         // Gem download (immutable) — wildcard because axum forbids two params per segment
         .route("/gems/gems/{filename}", get(download_gem))
         // Gemspec (immutable)
@@ -306,6 +306,56 @@ pub(super) async fn fetch_index_with_ttl(state: &AppState, filename: &str, ttl: 
 }
 
 // ── Compact index ──────────────────────────────────────────────────────
+
+// Apply downstream policy at the route boundary, covering checksum, legacy and
+// offline paths without changing the upstream policy retained in shared storage.
+async fn compact_index_with_cache_policy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    let response = compact_index(State(state.clone()), headers, Path(name.clone())).await;
+    let exempt = state
+        .curation()
+        .curation_engine
+        .cooldown_exempt(RegistryType::Gems, &name);
+    let ttl = if exempt {
+        state
+            .config
+            .gems
+            .exempt_info_http_max_age
+            .min(state.config.gems.info_http_max_age)
+    } else {
+        state.config.gems.info_http_max_age
+    };
+    info_cache_policy(response, ttl)
+}
+
+fn info_cache_policy(mut response: Response, ttl: u64) -> Response {
+    let restricted = response
+        .headers()
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                value.split(',').any(|directive| {
+                    let name = directive.trim().split('=').next().unwrap_or("").trim();
+                    ["no-store", "private", "no-cache"]
+                        .iter()
+                        .any(|restricted| name.eq_ignore_ascii_case(restricted))
+                })
+            })
+        });
+    if response.status() == StatusCode::OK
+        && !response.headers().contains_key("x-nora-stale")
+        && !restricted
+    {
+        if let Ok(value) = HeaderValue::from_str(&format!("public, max-age={ttl}")) {
+            response.headers_mut().insert(header::CACHE_CONTROL, value);
+        }
+    }
+    response
+}
 
 async fn compact_index(
     State(state): State<AppState>,
@@ -1775,6 +1825,103 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    #[tokio::test]
+    async fn info_http_policy_splits_exempt_names_on_cached_and_offline_paths() {
+        for checksum_cache in [false, true] {
+            for proxy in [None, Some("http://127.0.0.1:1".to_string())] {
+                let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+                    cfg.gems.enabled = true;
+                    cfg.gems.proxy = proxy;
+                    cfg.gems.info_checksum_cache = checksum_cache;
+                    cfg.curation.gems.cooldown_exempt_packages = vec!["rails".into()];
+                });
+                for (name, policy) in [
+                    ("rake", "public, max-age=86400"),
+                    ("rails", "public, max-age=60"),
+                ] {
+                    ctx.state
+                        .storage
+                        .put(&format!("gems/info/{name}"), b"---\n1.0.0\n")
+                        .await
+                        .unwrap();
+                    let response =
+                        send(&ctx.app, Method::GET, &format!("/gems/info/{name}"), "").await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()[header::CACHE_CONTROL], policy);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn info_http_policy_uses_configured_lifetimes_and_reloaded_exemptions() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            cfg.gems.info_http_max_age = 120;
+            cfg.gems.exempt_info_http_max_age = 10;
+        });
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"---\n1.0.0\n")
+            .await
+            .unwrap();
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=120"
+        );
+        let mut updated = (*ctx.state.config).clone();
+        updated.curation.gems.cooldown_exempt_packages = vec!["rails".into()];
+        ctx.state
+            .reloadable
+            .store(std::sync::Arc::new(crate::ReloadableConfig {
+                curation_engine: crate::build_curation_engine(&updated).unwrap(),
+                bypass_token: None,
+            }));
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=10"
+        );
+    }
+
+    #[test]
+    fn info_http_policy_preserves_errors_stale_and_restricted_responses() {
+        use axum::response::IntoResponse;
+        for policy in ["private", "public, no-store", "No-Cache=\"etag\""] {
+            let mut response = StatusCode::OK.into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, policy.parse().unwrap());
+            assert_eq!(
+                super::info_cache_policy(response, 86400).headers()[header::CACHE_CONTROL],
+                policy
+            );
+        }
+        for (status, stale) in [(StatusCode::BAD_GATEWAY, false), (StatusCode::OK, true)] {
+            let mut response = status.into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "public, max-age=0, must-revalidate".parse().unwrap(),
+            );
+            if stale {
+                response
+                    .headers_mut()
+                    .insert("x-nora-stale", "true".parse().unwrap());
+            }
+            assert_eq!(
+                super::info_cache_policy(response, 86400).headers()[header::CACHE_CONTROL],
+                "public, max-age=0, must-revalidate"
+            );
+        }
+        let response = super::info_cache_policy(StatusCode::OK.into_response(), 0);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=0"
+        );
+    }
+
     #[test]
     fn quarantine_exemption_requires_every_identity_in_one_curation_snapshot() {
         use crate::digest_quarantine::QuarantineMode;
@@ -2128,7 +2275,14 @@ mod integration_tests {
             let key = format!("gems/{resource}");
             let resp = send(&ctx.app, Method::GET, &route, "").await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(resp.headers()[header::CACHE_CONTROL], policy);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                if resource == "versions" {
+                    policy
+                } else {
+                    "public, max-age=86400"
+                }
+            );
             assert_eq!(body_bytes(resp).await.as_ref(), b"index");
             // /info/ persists its body and metadata in a background task.
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2147,7 +2301,14 @@ mod integration_tests {
             .unwrap();
             let resp = send(&ctx.app, Method::GET, &route, "").await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(resp.headers()[header::CACHE_CONTROL], policy);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                if resource == "versions" {
+                    policy
+                } else {
+                    "public, max-age=86400"
+                }
+            );
             assert_eq!(body_bytes(resp).await.as_ref(), b"index");
             upstream.verify().await;
         }
@@ -2190,7 +2351,14 @@ mod integration_tests {
             .await;
             let resp = send(&ctx.app, Method::GET, &format!("/gems/{resource}"), "").await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(resp.headers()[header::CACHE_CONTROL], "max-age=90, public");
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                if resource == "versions" {
+                    "max-age=90, public"
+                } else {
+                    "public, max-age=86400"
+                }
+            );
             assert_eq!(body_bytes(resp).await.as_ref(), b"index");
         }
     }

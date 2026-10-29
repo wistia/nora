@@ -29,6 +29,12 @@ pub struct GemsConfig {
     /// Maximum residence time in the bounded per-process /info body cache.
     #[serde(default = "default_info_cache_ttl")]
     pub info_cache_ttl: i64,
+    /// Downstream HTTP cache lifetime for successful /info responses, in seconds.
+    #[serde(default = "default_info_http_max_age")]
+    pub info_http_max_age: u64,
+    /// Downstream lifetime for exact-name cooldown exemptions, in seconds.
+    #[serde(default = "default_exempt_info_http_max_age")]
+    pub exempt_info_http_max_age: u64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
     /// Revalidate stale compact-index metadata with a conditional request
@@ -46,6 +52,13 @@ fn default_info_cache_ttl() -> i64 {
     86400
 }
 
+fn default_info_http_max_age() -> u64 {
+    86400
+}
+fn default_exempt_info_http_max_age() -> u64 {
+    60
+}
+
 fn default_gems_proxy() -> Option<String> {
     Some("https://rubygems.org".to_string())
 }
@@ -61,6 +74,8 @@ impl Default for GemsConfig {
             info_checksum_cache: true,
             exempt_metadata_ttl: default_exempt_metadata_ttl(),
             info_cache_ttl: default_info_cache_ttl(),
+            info_http_max_age: default_info_http_max_age(),
+            exempt_info_http_max_age: default_exempt_info_http_max_age(),
             serve_stale: true,
             revalidate: true,
         }
@@ -103,6 +118,20 @@ impl GemsConfig {
                 "NORA_GEMS_INFO_CACHE_TTL",
                 &val,
                 &mut self.info_cache_ttl,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_INFO_HTTP_MAX_AGE") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_INFO_HTTP_MAX_AGE",
+                &val,
+                &mut self.info_http_max_age,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_EXEMPT_INFO_HTTP_MAX_AGE") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_EXEMPT_INFO_HTTP_MAX_AGE",
+                &val,
+                &mut self.exempt_info_http_max_age,
             );
         }
         if let Ok(val) = env::var("NORA_GEMS_SERVE_STALE") {

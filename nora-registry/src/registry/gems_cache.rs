@@ -1213,7 +1213,7 @@ mod tests {
         let result = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
         assert_eq!(
             result.headers()[header::CACHE_CONTROL],
-            "max-age=17, public"
+            "public, max-age=86400"
         );
         assert_eq!(body_bytes(result).await.as_ref(), body.as_bytes());
         assert!(ctx
@@ -1357,7 +1357,10 @@ mod tests {
             .unwrap();
         let first = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
         assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(first.headers()[header::CACHE_CONTROL], "max-age=60, public");
+        assert_eq!(
+            first.headers()[header::CACHE_CONTROL],
+            "public, max-age=86400"
+        );
         assert_eq!(body_bytes(first).await.as_ref(), body.as_bytes());
         let key = format!(".nora-gems-info/rails/{}", checksum(body));
         // A separate replica starts with no local state and uses shared S3-equivalent storage.
