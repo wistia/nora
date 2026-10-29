@@ -54,27 +54,45 @@ gem. The rest of the index remains usable. If the whole index cannot be used,
 Nora backs off refresh attempts for five seconds instead of rereading and
 parsing it for every `/info` request.
 
-The mutable `gems/info/<gem>` alias is still used by browsing and filename
-identity readers. Successful responses offer the alias for background repair,
-including hot hits, shared-object reuse after restart, and legacy migrations.
-Repair checks the body and validator/Cache-Control sidecar together; a partial
-metadata failure is retried too. New checksum envelopes retain validators for
-this purpose. Older envelopes remain readable and safely default to empty
-validators rather than preserving validators for another body.
+## UI and filename-identity readers
 
-Alias checks perform no storage I/O on the request path. They are request-driven,
-coalesced per gem, and limited to four workers with at most one pending target
-per active gem. Idle health tracking is bounded to 4,096 entries and retains no
-body buffers. Failed or cancelled repairs can retry on a later hit after five
-seconds. Healthy aliases are rechecked after five minutes, or a shorter positive
-configured checksum interval. If all workers are busy, a later hit can schedule
-the repair instead of building an unbounded queue. A newer queued/current local
-snapshot supersedes an old repair target. The alias remains best-effort mutable
-metadata; checksum-keyed objects remain the authority for cached responses.
+The UI and ambiguous-filename checks select the same checksum-keyed documents
+as `/info`, using a shared cache-only resolver. No background mutable alias
+writer or alias-repair workers remain for checksum-managed metadata. An older
+replica may retain its own bounded-age checksum snapshot, but writing an old `gems/info/<gem>` alias cannot
+roll back a newer replica's UI or identity metadata.
+
+Cached readers share the published snapshot and hot document cache. A cold
+reader can load `/versions` from shared storage; concurrent cache-only readers
+share that load and parse for the configured refresh interval per replica. It does not fetch upstream `/versions` or `/info`.
+With metadata caching disabled (`metadata_ttl=0`), read-only consumers reuse their
+observed shared snapshot for five seconds to avoid repeatedly parsing the whole
+index. Failed shared-index reads also back off for five seconds. An upstream
+HTTP refresh never holds the published-snapshot lock during network I/O, so
+cache-only consumers can keep using their view while it is in progress.
+
+Version/platform summaries are parsed once per hot document. Identity lookups
+deduplicate candidate package names and limit concurrent storage lookups to four.
+A known checksum with no usable body never falls back to a mismatching alias;
+missing or stale managed identity data keeps every possible filename identity
+subject to policy. The UI still merges cached `.gem` versions through its
+existing single storage listing. Internal namespaces, disabled checksum caching,
+and gems without a usable checksum retain their legacy local metadata path.
+Offline registries prefer explicit local metadata; if it is absent, cached
+checksum documents remain available without upstream access.
+
+Transient `/info` failures can serve a previously validated hot document. After
+restart, a last-resort fallback examines at most 16 stored checksum objects with
+at most four concurrent reads and validates their content checksums. Concurrent
+fallbacks coalesce that scan, retain only the best candidate, and warm the hot
+cache for later stale responses. These
+history reads happen only on the failure path. Mutable legacy bodies remain a
+compatibility fallback, but no managed reader uses them in place of a known
+checksum. Stale responses are never stored under the new checksum key.
 
 If `/versions` cannot be used, or it has no usable entry for a gem, Nora retains
 its previous `/info` TTL/ETag/Last-Modified behavior. Transient `/info` fetch
-failures also honor `serve_stale=true` when an old named body is available,
+failures also honor `serve_stale=true` when an old validated or legacy body is available,
 even if its checksum differs from the current snapshot. Such responses carry
 `X-Nora-Stale: true` and `Cache-Control: public, max-age=0, must-revalidate`;
 they are never stored under the new checksum. Checksum mismatches are not

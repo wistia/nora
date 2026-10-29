@@ -1152,12 +1152,13 @@ pub async fn get_go_detail(
 /// Generic detail for new-format registries (NuGet, Gems, Terraform, Ansible, Pub, Conan).
 /// Reads version info from storage using registry-specific paths.
 pub async fn get_generic_detail(
-    storage: &Storage,
+    state: &AppState,
     registry: &str,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     let name_lower = name.to_lowercase();
 
     match RegistryType::from_str_opt(registry) {
@@ -1169,9 +1170,7 @@ pub async fn get_generic_detail(
         }
         Some(RegistryType::Rpm) => get_rpm_detail(storage, name, show_all).await,
         Some(RegistryType::Deb) => get_deb_detail(storage, name, show_all).await,
-        Some(RegistryType::Gems) => {
-            get_gems_detail(storage, &name_lower, show_prerelease, show_all).await
-        }
+        Some(RegistryType::Gems) => get_gems_detail(state, name, show_prerelease, show_all).await,
         Some(RegistryType::Hex) => {
             get_hex_detail(storage, &name_lower, show_prerelease, show_all).await
         }
@@ -1535,22 +1534,45 @@ async fn get_deb_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
 }
 
 async fn get_gems_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
-    // Read compact index: gems/info/{name}
-    // Format: "VERSION DEPS|checksum:HEX" per line, first line is "---"
-    let info_key = format!("gems/info/{}", name);
-    let info_ts = storage
-        .stat(&info_key)
-        .await
-        .map(|m| format_timestamp(m.modified))
-        .unwrap_or_else(|| "N/A".to_string());
-
+    let storage = &state.storage;
     let prefix = format!("gems/gems/{name}-");
-    let stored = storage.list_with_meta(&prefix).await.unwrap_or_default();
+    let (info, stored) = tokio::join!(
+        crate::registry::gems_cache::cached_info(state, name),
+        storage.list_with_meta(&prefix)
+    );
+    let stored = stored.unwrap_or_default();
+    let (tokens, info_ts) = match info {
+        crate::registry::gems_cache::CachedInfo::Managed {
+            document,
+            checked_at,
+            ..
+        } => (
+            document.map_or_else(std::collections::HashSet::new, |document| {
+                document.versions().clone()
+            }),
+            if checked_at > 0 {
+                format_timestamp(checked_at)
+            } else {
+                "N/A".into()
+            },
+        ),
+        crate::registry::gems_cache::CachedInfo::Legacy => {
+            let key = format!("gems/info/{name}");
+            let (body, metadata) = tokio::join!(storage.get(&key), storage.stat(&key));
+            (
+                body.ok()
+                    .map_or_else(std::collections::HashSet::new, |body| {
+                        crate::registry::gems_cache::version_tokens(&String::from_utf8_lossy(&body))
+                    }),
+                metadata.map_or_else(|| "N/A".into(), |meta| format_timestamp(meta.modified)),
+            )
+        }
+    };
     let cached: std::collections::HashMap<_, _> = stored
         .iter()
         .map(|(key, meta)| (key.as_str(), meta))
@@ -1558,37 +1580,22 @@ async fn get_gems_detail(
     let mut listed = std::collections::HashSet::new();
     let mut versions = Vec::new();
 
-    if let Ok(data) = storage.get(&info_key).await {
-        if let Ok(text) = String::from_utf8(data.to_vec()) {
-            for line in text.lines() {
-                if line.starts_with('-') || line.is_empty() {
-                    continue;
-                }
-                // "1.3.0 deps...|checksum:..." — version is first token
-                let version = match line.split_whitespace().next() {
-                    Some(v) if v.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
-                        v.to_string()
-                    }
-                    _ => continue,
-                };
+    for version in tokens {
+        listed.insert(version.clone());
+        // Check if .gem is cached
+        let gem_key = format!("gems/gems/{}-{}.gem", name, version);
+        let (size, published, cached) = if let Some(meta) = cached.get(gem_key.as_str()) {
+            (meta.size, format_timestamp(meta.modified), true)
+        } else {
+            (0, info_ts.clone(), false)
+        };
 
-                listed.insert(version.clone());
-                // Check if .gem is cached
-                let gem_key = format!("gems/gems/{}-{}.gem", name, version);
-                let (size, published, cached) = if let Some(meta) = cached.get(gem_key.as_str()) {
-                    (meta.size, format_timestamp(meta.modified), true)
-                } else {
-                    (0, info_ts.clone(), false)
-                };
-
-                versions.push(VersionInfo {
-                    version,
-                    size,
-                    published,
-                    cached,
-                });
-            }
-        }
+        versions.push(VersionInfo {
+            version,
+            size,
+            published,
+            cached,
+        });
     }
 
     // A lockfile install can cache .gem files without ever fetching /info/name.
@@ -2535,7 +2542,9 @@ mod gems_detail_cache_tests {
             .put("gems/gems/net-smtp-extra-1.0.0.gem", b"other")
             .await
             .unwrap();
-        let detail = get_gems_detail(&storage, "net-smtp", true, true).await;
+        let mut ctx = crate::test_helpers::create_test_context();
+        ctx.state.storage = storage.clone();
+        let detail = get_gems_detail(&ctx.state, "net-smtp", true, true).await;
         assert_eq!(detail.versions.len(), 1);
         assert_eq!(detail.versions[0].version, "0.5.2");
         assert!(detail.versions[0].cached);
@@ -2546,7 +2555,7 @@ mod gems_detail_cache_tests {
             )
             .await
             .unwrap();
-        let detail = get_gems_detail(&storage, "net-smtp", true, true).await;
+        let detail = get_gems_detail(&ctx.state, "net-smtp", true, true).await;
         assert_eq!(detail.versions.len(), 2);
         assert_eq!(detail.versions[0].version, "0.6.0");
         assert!(!detail.versions[0].cached);
@@ -2574,7 +2583,9 @@ mod object_store_detail_tests {
             ("hex", "jason", "1.4.4", 7),
             ("gems", "net-smtp", "0.5.2", 3),
         ] {
-            let detail = get_generic_detail(&storage, registry, name, true, true).await;
+            let mut ctx = crate::test_helpers::create_test_context();
+            ctx.state.storage = storage.clone();
+            let detail = get_generic_detail(&ctx.state, registry, name, true, true).await;
             assert_eq!(detail.versions.len(), 1);
             assert_eq!(detail.versions[0].version, version);
             assert_eq!(detail.versions[0].size, size);

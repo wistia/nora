@@ -394,6 +394,11 @@ async fn compact_index(
                 with_text(data.to_vec()),
                 metadata.cache_control.as_deref(),
             ),
+            None if !internal && state.config.gems.info_checksum_cache => {
+                super::gems_cache::offline_info(&state, &name)
+                    .await
+                    .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         };
     };
@@ -1440,38 +1445,63 @@ pub fn split_gem_filename(stem: &str) -> Option<(String, String)> {
 /// Whether a compact index (`/info/<name>`) lists a reading: its rows after `---` start with
 /// `version` or `version-platform` (rubygems `resolver/api_set/gem_parser.rb` splits that
 /// field at its first `-`).
-fn compact_index_lists(index: &str, file: &GemFile) -> bool {
-    let wanted = match &file.platform {
-        Some(platform) => format!("{}-{}", file.version, platform),
-        None => file.version.clone(),
-    };
-    let lines: Vec<&str> = index.lines().collect();
-    let rows = match lines.iter().position(|line| *line == "---") {
-        Some(header) => &lines[header + 1..],
-        None => &lines[..],
-    };
-    rows.iter()
-        .any(|row| row.split(' ').next() == Some(wanted.as_str()))
+fn compact_index_lists(versions: &std::collections::HashSet<String>, file: &GemFile) -> bool {
+    let wanted = file.platform.as_ref().map_or_else(
+        || file.version.clone(),
+        |platform| format!("{}-{platform}", file.version),
+    );
+    versions.contains(&wanted)
 }
 
 /// The readings of a gem file name curation decides on. One reading is the file. Of several,
-/// those the compact index NORA holds for their gem lists (`gems/info/<name>`: upstream's own
+/// those the checksum-selected compact index NORA holds for their gem lists (upstream's own
 /// record of which versions and platforms exist; RubyGems gives a file name to one gem only,
 /// so a listed reading is the file) — and every reading while none is listed.
-async fn gem_file_identities(state: &AppState, readings: Vec<GemFile>) -> Vec<GemFile> {
+pub(super) async fn gem_file_identities(state: &AppState, readings: Vec<GemFile>) -> Vec<GemFile> {
     if readings.len() < 2 {
+        return readings;
+    }
+    use futures::StreamExt;
+    let names: std::collections::HashSet<_> = readings
+        .iter()
+        .map(|reading| reading.name.clone())
+        .collect();
+    let indexes: std::collections::HashMap<_, _> = futures::stream::iter(names)
+        .map(|name| async move {
+            let versions = match super::gems_cache::cached_info(state, &name).await {
+                super::gems_cache::CachedInfo::Managed {
+                    document: Some(document),
+                    fresh: true,
+                    ..
+                } => (Some(document.versions().clone()), false),
+                super::gems_cache::CachedInfo::Managed { .. } => (None, true), // unknown/stale: weigh every possible identity
+                super::gems_cache::CachedInfo::Legacy => (
+                    state
+                        .storage
+                        .get(&format!("gems/info/{name}"))
+                        .await
+                        .ok()
+                        .map(|body| {
+                            super::gems_cache::version_tokens(&String::from_utf8_lossy(&body))
+                        }),
+                    false,
+                ),
+            };
+            (name, versions)
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    if indexes.values().any(|(_, unresolved)| *unresolved) {
         return readings;
     }
     let mut listed = Vec::new();
     for reading in &readings {
-        let Ok(index) = state
-            .storage
-            .get(&format!("gems/info/{}", reading.name))
-            .await
-        else {
-            continue;
-        };
-        if compact_index_lists(&String::from_utf8_lossy(&index), reading) {
+        if indexes
+            .get(&reading.name)
+            .and_then(|(versions, _)| versions.as_ref())
+            .is_some_and(|versions| compact_index_lists(versions, reading))
+        {
             listed.push(reading.clone());
         }
     }
@@ -2540,7 +2570,7 @@ mod platform_gem_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gem_file_names_per_rubygems {
-    use super::{compact_index_lists, gem_file_readings, GemFile};
+    use super::{compact_index_lists_text as compact_index_lists, gem_file_readings, GemFile};
     use proptest::prelude::*;
 
     fn file(name: &str, version: &str, platform: Option<&str>) -> GemFile {
@@ -3028,7 +3058,7 @@ mod gem_file_identity_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gem_file_every_reading_counts {
-    use super::{compact_index_lists, GemFile};
+    use super::{compact_index_lists_text as compact_index_lists, GemFile};
     use crate::test_helpers::{create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::any;
@@ -3763,4 +3793,9 @@ mod gem_file_name_work {
             );
         }
     }
+}
+
+#[cfg(test)]
+fn compact_index_lists_text(index: &str, file: &GemFile) -> bool {
+    compact_index_lists(&super::gems_cache::version_tokens(index), file)
 }
