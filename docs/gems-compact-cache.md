@@ -28,8 +28,13 @@ fetch the same body concurrently, which is safe; no distributed lock is needed.
 
 Nora checks a downloaded or shared body against its expected checksum before
 using it. A mismatch (for example while upstream CDN nodes disagree during a
-publish) returns an uncacheable 502 and discards the local checksum snapshot so
-the next request can refresh it. MD5 is the protocol's change identifier, not a
+publish) forces an upstream `/versions` revalidation even if the shared S3 index
+is still fresh, then retries the `/info` lookup once. Concurrent requests reuse
+a snapshot that another request has already recovered. Successful forced checks
+are reused for five seconds even when they return 304 with the same checksum,
+so a concurrent publishing-race failure cannot force one index check per caller.
+A persistent mismatch returns an uncacheable 502 and never publishes the mismatched body under the
+expected checksum. MD5 is the protocol's change identifier, not a
 security guarantee; existing storage integrity and artifact curation gates
 remain in force.
 
@@ -43,9 +48,19 @@ not proactively deleted by this implementation; configure an S3 lifecycle rule
 for the internal prefix if storage retention needs a bound. Active objects can
 always be reconstructed from upstream after expiration.
 
-If `/versions` cannot be used, or it has no entry for a gem, Nora retains its
-previous `/info` TTL/ETag/Last-Modified and stale-on-error behavior. Internal
-namespace gems and offline-only registries continue to use their local copies,
+Records with missing or unsupported checksums disable checksum caching only
+for their own gem; an unusable latest record clears any older checksum for that
+gem. The rest of the index remains usable. If the whole index cannot be used,
+Nora backs off refresh attempts for five seconds instead of rereading and
+parsing it for every `/info` request.
+
+If `/versions` cannot be used, or it has no usable entry for a gem, Nora retains
+its previous `/info` TTL/ETag/Last-Modified behavior. Transient `/info` fetch
+failures also honor `serve_stale=true` when an old named body is available,
+even if its checksum differs from the current snapshot. Such responses carry
+`X-Nora-Stale: true` and `Cache-Control: public, max-age=0, must-revalidate`;
+they are never stored under the new checksum. Checksum mismatches are not
+treated as transient fetch failures. Internal namespace gems and offline-only registries continue to use their local copies,
 without consulting upstream `/versions`. Namespace and curation checks run
 before the hot cache is consulted.
 

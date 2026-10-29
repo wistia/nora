@@ -6,7 +6,7 @@
 //! MD5 is the protocol's change identifier, not a security/integrity guarantee.
 
 use super::gems::{fetch_index_with_ttl, read_index_metadata, write_index_metadata, IndexMetadata};
-use super::{proxy_fetch_conditional_with_cache_control, Revalidation, Validators};
+use super::{proxy_fetch_conditional_with_cache_control, ProxyError, Revalidation, Validators};
 use crate::cache_ttl::{is_within_ttl, now_unix};
 use crate::config::UpstreamAuth;
 use crate::registry_type::RegistryType;
@@ -29,11 +29,13 @@ const MAX_HOT_ENTRIES: usize = 4096;
 pub(crate) struct CompactCache {
     snapshot: tokio::sync::Mutex<Option<Snapshot>>,
     hot: parking_lot::Mutex<HotCache>,
-    fills: crate::proxy_coalesce::InflightMap<Arc<InfoDocument>>,
+    fills: crate::proxy_coalesce::InflightMap<FillOutcome>,
+    versions_failure: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 struct Snapshot {
     checked_at: u64,
+    forced_at: Option<std::time::Instant>,
     checksums: HashMap<String, String>,
 }
 
@@ -48,6 +50,20 @@ struct InfoDocument {
     body: String,
     cache_control: Option<String>,
 }
+
+#[derive(Clone)]
+enum FillOutcome {
+    Ready(Arc<InfoDocument>),
+    ChecksumMismatch,
+    TransientFailure,
+    NotFound,
+    CircuitOpen(String),
+    InvalidBody,
+}
+
+// An unusable upstream index must not serialize every /info request behind a
+// full index read and parse. A successful refresh clears this short backoff.
+const VERSIONS_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 impl HotCache {
     fn get(&mut self, key: &str, ttl: i64) -> Option<Arc<InfoDocument>> {
@@ -119,17 +135,25 @@ fn parse_versions(body: &[u8]) -> Option<HashMap<String, String>> {
     let mut checksums = HashMap::new();
     for line in records.lines().filter(|line| !line.trim().is_empty()) {
         let mut fields = line.split_whitespace();
-        let name = fields.next()?;
-        let _versions = fields.next()?;
-        let checksum = fields.next()?;
-        if fields.next().is_some()
-            || !super::gems::is_valid_gem_name(name)
-            || checksum.len() != 32
-            || !checksum.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return None;
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if !super::gems::is_valid_gem_name(name) {
+            continue;
         }
-        checksums.insert(name.to_owned(), checksum.to_ascii_lowercase());
+        let versions = fields.next();
+        let checksum = fields.next().filter(|checksum| {
+            checksum.len() == 32 && checksum.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        if versions.is_some() && fields.next().is_none() {
+            if let Some(checksum) = checksum {
+                checksums.insert(name.to_owned(), checksum.to_ascii_lowercase());
+                continue;
+            }
+        }
+        // RubyGems has records with no checksum. Only this gem falls back to
+        // legacy metadata caching; an unusable last row clears any older hash.
+        checksums.remove(name);
     }
     Some(checksums)
 }
@@ -139,6 +163,14 @@ fn matches_checksum(body: &[u8], checksum: &str) -> bool {
 }
 
 async fn expected_checksum(state: &AppState, name: &str) -> Option<String> {
+    expected_checksum_with_refresh(state, name, None).await
+}
+
+async fn expected_checksum_with_refresh(
+    state: &AppState,
+    name: &str,
+    rejected: Option<&str>,
+) -> Option<String> {
     let exempt = state
         .curation()
         .curation_engine
@@ -154,35 +186,82 @@ async fn expected_checksum(state: &AppState, name: &str) -> Option<String> {
     // A single refresh per replica, shared by all concurrent /info requests.
     // Cancellation releases the mutex; incomplete snapshots are never published.
     let mut snapshot = state.gems_cache.snapshot.lock().await;
-    if snapshot
-        .as_ref()
-        .is_none_or(|snapshot| !is_within_ttl(snapshot.checked_at, ttl))
-    {
-        // Sample freshness before fetching. A later stat could observe another
-        // replica's newer write and incorrectly extend this older body's TTL.
-        let started_at = now_unix();
-        let cached_at = state
-            .storage
-            .stat("gems/versions")
-            .await
-            .map(|meta| meta.modified);
-        let response = fetch_index_with_ttl(state, "versions", ttl).await;
-        if response.status() != StatusCode::OK || response.headers().contains_key("x-nora-stale") {
-            return None; // legacy conditional-fetch/serve-stale path remains available
+    let force = rejected.is_some();
+    // Reuse a newer checksum or a recent forced check, including a 304 that
+    // confirms the same checksum. A failed publication wave must not serialize
+    // one forced index revalidation per waiting /info caller.
+    if let Some(rejected) = rejected {
+        if let Some(current) = snapshot
+            .as_ref()
+            .filter(|snapshot| is_within_ttl(snapshot.checked_at, ttl))
+        {
+            if let Some(checksum) = current.checksums.get(name) {
+                if checksum != rejected
+                    || current
+                        .forced_at
+                        .is_some_and(|at| at.elapsed() < VERSIONS_RETRY_BACKOFF)
+                {
+                    return Some(checksum.clone());
+                }
+            }
         }
-        let body = to_bytes(response.into_body(), MAX_VERSIONS_BYTES)
-            .await
-            .ok()?;
-        let checksums = parse_versions(&body)?;
-        // Use the shared object's actual validation time, not the time we read it:
-        // another replica's nearly-expired copy must not get a new TTL locally.
-        let checked_at = cached_at
-            .filter(|time| is_within_ttl(*time, ttl))
-            .unwrap_or(started_at);
-        *snapshot = Some(Snapshot {
-            checked_at,
-            checksums,
-        });
+    }
+    if state
+        .gems_cache
+        .versions_failure
+        .lock()
+        .as_ref()
+        .is_some_and(|failed_at| failed_at.elapsed() < VERSIONS_RETRY_BACKOFF)
+    {
+        return None;
+    }
+    if force
+        || snapshot
+            .as_ref()
+            .is_none_or(|snapshot| !is_within_ttl(snapshot.checked_at, ttl))
+    {
+        let refreshed = async {
+            // A mismatch requires an upstream revalidation, even if another
+            // replica recently wrote the currently cached /versions object.
+            let fetch_ttl = if force { 0 } else { ttl };
+            let started_at = now_unix();
+            let cached_at = state
+                .storage
+                .stat("gems/versions")
+                .await
+                .map(|meta| meta.modified);
+            let response = fetch_index_with_ttl(state, "versions", fetch_ttl).await;
+            if response.status() != StatusCode::OK
+                || response.headers().contains_key("x-nora-stale")
+            {
+                return None;
+            }
+            let body = to_bytes(response.into_body(), MAX_VERSIONS_BYTES)
+                .await
+                .ok()?;
+            let checksums = parse_versions(&body)?;
+            // A later stat could observe another replica's newer write and
+            // incorrectly extend this older body's TTL. Sample before fetching.
+            let checked_at = cached_at
+                .filter(|time| !force && is_within_ttl(*time, ttl))
+                .unwrap_or(started_at);
+            Some(Snapshot {
+                checked_at,
+                forced_at: force.then(std::time::Instant::now),
+                checksums,
+            })
+        }
+        .await;
+        if let Some(refreshed) = refreshed {
+            *snapshot = Some(refreshed);
+            *state.gems_cache.versions_failure.lock() = None;
+        } else {
+            *state.gems_cache.versions_failure.lock() = Some(std::time::Instant::now());
+            if force {
+                *snapshot = None;
+            }
+            return None;
+        }
     }
     snapshot.as_ref()?.checksums.get(name).cloned()
 }
@@ -206,13 +285,66 @@ fn response(document: &InfoDocument) -> Response {
 /// None means no usable /versions entry: retain the existing metadata TTL,
 /// conditional revalidation, offline and stale-on-error behavior.
 pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
-    let checksum = expected_checksum(state, name).await?;
+    let mut checksum = expected_checksum(state, name).await?;
+    state.metrics.record_download("gems");
+    for attempt in 0..2 {
+        match load_info(state, name, &checksum).await {
+            FillOutcome::Ready(document) => return Some(response(&document)),
+            FillOutcome::ChecksumMismatch => {
+                if attempt == 0 {
+                    if let Some(updated) =
+                        expected_checksum_with_refresh(state, name, Some(&checksum)).await
+                    {
+                        checksum = updated;
+                        continue;
+                    }
+                }
+                // Keep a successfully revalidated snapshot on persistent mismatch:
+                // queued callers must be able to observe its forced-refresh time.
+            }
+            FillOutcome::TransientFailure => {
+                if state.config.gems.serve_stale {
+                    if let Ok(body) = state.storage.get(&format!("gems/info/{name}")).await {
+                        state.metrics.record_cache_hit("gems");
+                        // Serve the old named body only as an explicitly stale response.
+                        // It must never be published under the new checksum key.
+                        return Some(
+                            (
+                                [
+                                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                                    (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
+                                    (header::HeaderName::from_static("x-nora-stale"), "true"),
+                                ],
+                                body,
+                            )
+                                .into_response(),
+                        );
+                    }
+                }
+            }
+            FillOutcome::NotFound => return Some(StatusCode::NOT_FOUND.into_response()),
+            FillOutcome::CircuitOpen(registry) => {
+                return Some(super::circuit_open_response(&registry))
+            }
+            FillOutcome::InvalidBody => {}
+        }
+        break;
+    }
+    Some(
+        (
+            StatusCode::BAD_GATEWAY,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response(),
+    )
+}
+
+async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome {
     let key = format!(".nora-gems-info/{name}/{checksum}");
     let ttl = state.config.gems.info_cache_ttl;
     if let Some(document) = state.gems_cache.hot.lock().get(&key, ttl) {
-        state.metrics.record_download("gems");
         state.metrics.record_cache_hit("gems");
-        return Some(response(&document));
+        return FillOutcome::Ready(document);
     }
     let document = state
         .gems_cache
@@ -224,11 +356,11 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
             || async {
                 // Recheck after election; a previous fill may just have finished.
                 if let Some(document) = state.gems_cache.hot.lock().get(&key, ttl) {
-                    return Some(document);
+                    return Some(FillOutcome::Ready(document));
                 }
                 if let Ok(bytes) = state.storage.get(&key).await {
                     if let Ok(document) = serde_json::from_slice::<InfoDocument>(&bytes) {
-                        if matches_checksum(document.body.as_bytes(), &checksum) {
+                        if matches_checksum(document.body.as_bytes(), checksum) {
                             let document = Arc::new(document);
                             state
                                 .gems_cache
@@ -236,7 +368,7 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
                                 .lock()
                                 .insert(key.clone(), Arc::clone(&document));
                             state.metrics.record_cache_hit("gems");
-                            return Some(document);
+                            return Some(FillOutcome::Ready(document));
                         }
                     }
                 }
@@ -244,7 +376,7 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
                 let legacy_key = format!("gems/info/{name}");
                 let legacy = state.storage.get(&legacy_key).await.ok();
                 let document =
-                    if let Some(body) = legacy.filter(|body| matches_checksum(body, &checksum)) {
+                    if let Some(body) = legacy.filter(|body| matches_checksum(body, checksum)) {
                         let metadata = read_index_metadata(state, &legacy_key).await;
                         InfoDocument {
                             body: String::from_utf8(body.to_vec()).ok()?,
@@ -255,7 +387,7 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
                             "{}/info/{name}",
                             state.config.gems.proxy.as_deref()?.trim_end_matches('/')
                         );
-                        let (result, cache_control) = proxy_fetch_conditional_with_cache_control(
+                        let fetched = proxy_fetch_conditional_with_cache_control(
                             &state.http_client,
                             &url,
                             Duration::from_secs(state.config.gems.proxy_timeout),
@@ -264,15 +396,31 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
                             &state.circuit_breaker,
                             RegistryType::Gems,
                         )
-                        .await
-                        .ok()?;
+                        .await;
+                        let (result, cache_control) = match fetched {
+                            Ok(result) => result,
+                            Err(ProxyError::NotFound) => return Some(FillOutcome::NotFound),
+                            Err(ProxyError::CircuitOpen(registry)) => {
+                                return Some(FillOutcome::CircuitOpen(registry))
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    registry = "gems",
+                                    name,
+                                    ?error,
+                                    "compact index upstream fetch failed"
+                                );
+                                return Some(FillOutcome::TransientFailure);
+                            }
+                        };
                         let Revalidation::Modified { body, validators } = result else {
                             return None;
                         };
-                        if body.len() > MAX_INFO_BYTES || !matches_checksum(&body, &checksum) {
-                            // A publishing race or stale upstream CDN must not poison this key.
-                            *state.gems_cache.snapshot.lock().await = None;
-                            return None;
+                        if body.len() > MAX_INFO_BYTES {
+                            return Some(FillOutcome::InvalidBody);
+                        }
+                        if !matches_checksum(&body, checksum) {
+                            return Some(FillOutcome::ChecksumMismatch);
                         }
                         state.metrics.record_cache_miss("gems");
                         // Keep the legacy browsing/date/identity readers working. This mutable
@@ -308,19 +456,11 @@ pub(super) async fn info(state: &AppState, name: &str) -> Option<Response> {
                     .hot
                     .lock()
                     .insert(key.clone(), Arc::clone(&document));
-                Some(document)
+                Some(FillOutcome::Ready(document))
             },
         )
         .await;
-    state.metrics.record_download("gems");
-    Some(match document {
-        Some(document) => response(&document),
-        None => (
-            StatusCode::BAD_GATEWAY,
-            [(header::CACHE_CONTROL, "no-store")],
-        )
-            .into_response(),
-    })
+    document.unwrap_or(FillOutcome::InvalidBody)
 }
 
 #[cfg(test)]
@@ -349,12 +489,358 @@ mod tests {
         let parsed = parse_versions(rewritten.as_bytes()).unwrap();
         assert!(!parsed.contains_key("rails"));
         assert_eq!(parsed["rack"], checksum("rack index"));
-        assert!(parse_versions(b"---\nrails 1.0.0 not-a-checksum\n").is_none());
+        assert!(parse_versions(b"---\nrails 1.0.0 not-a-checksum\n")
+            .unwrap()
+            .is_empty());
         assert!(
-            parse_versions(b"---\n../secret 1.0.0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n").is_none()
+            parse_versions(b"---\n../secret 1.0.0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(shorter_ttl(-1, 60), 60);
         assert_eq!(shorter_ttl(300, -1), 300);
+    }
+
+    #[test]
+    fn missing_or_unsupported_checksums_only_disable_the_affected_gem() {
+        // The two checksum-less package records are taken from the real index.
+        let parsed = parse_versions(include_bytes!(
+            "../../testdata/gems/compact-versions-missing-checksums.txt"
+        ))
+        .unwrap();
+        assert_eq!(parsed["rails"], "a".repeat(32));
+        assert_eq!(parsed["rack"], "b".repeat(32));
+        for name in ["yeptris", "moov_ruby", "cleared", "unsupported"] {
+            assert!(!parsed.contains_key(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_checksum_index_publishes_a_reusable_snapshot() {
+        let upstream = MockServer::start().await;
+        let body = "rails index";
+        Mock::given(path("/info/rails"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+        });
+        let index = format!(
+            "{}yeptris 0.6.28.3-x86_64-linux \nmoov_ruby 25.2.19 \n",
+            versions("rails", body)
+        );
+        ctx.state
+            .storage
+            .put("gems/versions", index.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            body_bytes(info(&ctx.state, "rails").await.unwrap())
+                .await
+                .as_ref(),
+            body.as_bytes()
+        );
+        ctx.state.storage.delete("gems/versions").await.unwrap();
+        // A repeat can only succeed without an upstream /versions mock if the
+        // original mixed index was parsed and retained instead of discarded.
+        assert_eq!(
+            body_bytes(info(&ctx.state, "rails").await.unwrap())
+                .await
+                .as_ref(),
+            body.as_bytes()
+        );
+        assert!(ctx
+            .state
+            .storage
+            .get(&format!(".nora-gems-info/rails/{}", checksum(body)))
+            .await
+            .is_ok());
+        assert!(expected_checksum(&ctx.state, "yeptris").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unusable_index_refreshes_back_off_and_recover_after_the_backoff() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", b"not a compact index")
+            .await
+            .unwrap();
+        assert!(expected_checksum(&ctx.state, "rails").await.is_none());
+        ctx.state.storage.delete("gems/versions").await.unwrap();
+        assert!(expected_checksum(&ctx.state, "rails").await.is_none());
+        *ctx.state.gems_cache.versions_failure.lock() =
+            Some(std::time::Instant::now() - VERSIONS_RETRY_BACKOFF);
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", "index").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            expected_checksum(&ctx.state, "rails").await.unwrap(),
+            checksum("index")
+        );
+        assert!(ctx.state.gems_cache.versions_failure.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn mismatch_revalidates_a_fresh_shared_index_and_retries_once() {
+        let upstream = MockServer::start().await;
+        let old = "old index";
+        let new = "new index";
+        Mock::given(path("/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(versions("rails", new)))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/info/rails"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(new))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", old).as_bytes())
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_bytes(response).await.as_ref(), new.as_bytes());
+        }
+        assert!(ctx
+            .state
+            .storage
+            .get(&format!(".nora-gems-info/rails/{}", checksum(old)))
+            .await
+            .is_err());
+        assert!(ctx
+            .state
+            .storage
+            .get(&format!(".nora-gems-info/rails/{}", checksum(new)))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_mismatches_share_the_recovered_snapshot() {
+        let upstream = MockServer::start().await;
+        let new = "new index";
+        Mock::given(path("/versions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(versions("rails", new))
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/info/rails"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(new)
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", "old index").as_bytes())
+            .await
+            .unwrap();
+        let responses = futures::future::join_all((0..20).map(|_| info(&ctx.state, "rails"))).await;
+        for response in responses {
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_bytes(response).await.as_ref(), new.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_mismatch_is_bounded_and_does_not_serve_a_stale_body() {
+        let upstream = MockServer::start().await;
+        Mock::given(path("/versions"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/info/rails"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected"))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+            cfg.gems.serve_stale = true;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", "expected").as_bytes())
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"older body")
+            .await
+            .unwrap();
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!response.headers().contains_key("x-nora-stale"));
+        assert!(ctx
+            .state
+            .storage
+            .get(&format!(".nora-gems-info/rails/{}", checksum("expected")))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_persistent_mismatches_do_not_repeat_forced_304_checks() {
+        let upstream = MockServer::start().await;
+        Mock::given(path("/versions"))
+            .respond_with(ResponseTemplate::new(304).set_delay(Duration::from_millis(50)))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/info/rails"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("unexpected")
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", "expected").as_bytes())
+            .await
+            .unwrap();
+        let responses = futures::future::join_all((0..20).map(|_| info(&ctx.state, "rails"))).await;
+        for response in responses {
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        assert!(ctx
+            .state
+            .storage
+            .get(&format!(".nora-gems-info/rails/{}", checksum("expected")))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_respects_serve_stale_without_poisoning_the_new_key() {
+        for (serve_stale, cached) in [(true, true), (false, true), (true, false)] {
+            let upstream = MockServer::start().await;
+            Mock::given(path("/info/rails"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(upstream.uri());
+                cfg.gems.info_checksum_cache = true;
+                cfg.gems.serve_stale = serve_stale;
+            });
+            ctx.state
+                .storage
+                .put("gems/versions", versions("rails", "new index").as_bytes())
+                .await
+                .unwrap();
+            if cached {
+                ctx.state
+                    .storage
+                    .put("gems/info/rails", b"old index")
+                    .await
+                    .unwrap();
+            }
+            let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+            if serve_stale && cached {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "public, max-age=0, must-revalidate"
+                );
+                assert_eq!(response.headers()["x-nora-stale"], "true");
+                assert_eq!(body_bytes(response).await.as_ref(), b"old index");
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                assert!(!response.headers().contains_key("x-nora-stale"));
+            }
+            assert!(ctx
+                .state
+                .storage
+                .get(&format!(".nora-gems-info/rails/{}", checksum("new index")))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_not_found_does_not_use_the_stale_fallback() {
+        let upstream = MockServer::start().await;
+        Mock::given(path("/info/rails"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.info_checksum_cache = true;
+            cfg.gems.serve_stale = true;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", versions("rails", "new index").as_bytes())
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"old index")
+            .await
+            .unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/gems/info/rails", "")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
