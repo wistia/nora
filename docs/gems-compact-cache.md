@@ -1,8 +1,16 @@
 # RubyGems compact-index caching
 
-Nora keeps RubyGems' client/CloudFront `Cache-Control` unchanged. Server-side
-retention is independent: `/info/<gem>` bodies can stay in memory for a day
-without postponing dependency updates or yanks for a day.
+Successful `/info/<gem>` responses advertise `Cache-Control: public, max-age=86400`
+by default. Exact-name cooldown-exempt gems use `public, max-age=60` (capped by
+the normal lifetime). This downstream policy applies to fresh fetches, memory and
+shared-storage hits, legacy metadata, and offline copies. Stale fallbacks and
+errors do not receive the long lifetime; explicit upstream `private`, `no-store`
+or `no-cache` directives remain respected. `/versions` retains upstream headers.
+
+HTTP lifetime is separate from memory retention and checksum refresh intervals.
+A CDN or client can retain an ordinary gem's metadata for a day, including an old
+view of yanks or corrections. Adding an exemption affects new origin responses;
+already cached responses expire at their original TTL unless invalidated.
 
 ## Freshness and replicas
 
@@ -110,6 +118,8 @@ info_checksum_cache = true # default; false restores the previous /info path
 metadata_ttl = 300
 exempt_metadata_ttl = 60
 info_cache_ttl = 86400 # memory residence, not metadata freshness or HTTP max-age
+info_http_max_age = 86400 # downstream /info lifetime, seconds
+exempt_info_http_max_age = 60 # capped by info_http_max_age
 
 [curation.gems]
 cooldown_exempt_packages = ["my_internal_gem"]
@@ -129,9 +139,12 @@ Environment equivalents:
 - `NORA_GEMS_METADATA_TTL`
 - `NORA_GEMS_EXEMPT_METADATA_TTL`
 - `NORA_GEMS_INFO_CACHE_TTL`
+- `NORA_GEMS_INFO_HTTP_MAX_AGE`
+- `NORA_GEMS_EXEMPT_INFO_HTTP_MAX_AGE`
 - `NORA_CURATION_GEMS_COOLDOWN_EXEMPT_PACKAGES` (comma-separated exact names)
 
-Existing duration semantics apply: zero means immediately stale; `-1` disables
+HTTP max-age settings accept nonnegative seconds; zero requires revalidation.
+For server-side TTL settings, existing duration semantics apply: zero means immediately stale; `-1` disables
 expiry. Shorter exempt refresh settings do not lengthen an explicitly shorter
 normal TTL. Curation exemptions are read from the hot-reloaded engine, so SIGHUP
 changes take effect without clearing any body objects.
