@@ -11,6 +11,7 @@ pub(crate) mod deb;
 pub mod docker;
 pub mod docker_auth;
 pub(crate) mod gems;
+pub(crate) mod gems_cache;
 mod go;
 pub(crate) mod hex_registry;
 pub(crate) mod hf;

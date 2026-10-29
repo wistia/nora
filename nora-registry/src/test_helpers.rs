@@ -242,7 +242,10 @@ fn build_context_full(
             max_file_size: 1_048_576, // 1 MB
             cache_control: "no-cache".to_string(),
         },
-        gems: GemsConfig::default(),
+        gems: GemsConfig {
+            info_checksum_cache: false,
+            ..GemsConfig::default()
+        },
         terraform: TerraformConfig::default(),
         ansible: AnsibleConfig::default(),
         nuget: NugetConfig::default(),
@@ -388,6 +391,7 @@ fn build_context_full(
     };
     let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
+        gems_cache: Arc::default(),
         storage,
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),

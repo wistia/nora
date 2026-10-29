@@ -166,6 +166,12 @@ impl CurationEngine {
         self.config.cooldown_exempt(registry, name)
     }
 
+    pub fn has_cooldown_exempt_packages(&self, registry: RegistryType) -> bool {
+        self.config
+            .registry_override(registry)
+            .is_some_and(|section| !section.cooldown_exempt_packages.is_empty())
+    }
+
     /// Add a filter to the end of the chain.
     /// Evaluation order = insertion order.
     pub fn add_filter(&mut self, filter: Box<dyn ProxyFilter>) {

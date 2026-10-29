@@ -379,6 +379,7 @@ pub struct ReloadableConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
+    pub(crate) gems_cache: Arc<registry::gems_cache::CompactCache>,
     pub config: Arc<Config>,
     pub enabled_registries: Arc<HashSet<RegistryType>>,
     pub start_time: Instant,
@@ -3477,6 +3478,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let (tasks, maintenance) = supervision(&config.server);
     let state = AppState {
+        gems_cache: Arc::default(),
         storage,
         config: Arc::new(config),
         enabled_registries,

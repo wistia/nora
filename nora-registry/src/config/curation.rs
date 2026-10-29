@@ -156,8 +156,8 @@ pub struct RegistryCurationOverride {
     /// Override quarantine TTL for this specific registry.
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
-    /// Exact Hex package names exempt from release age and digest quarantine.
-    /// Only supported for Hex; other registry sections reject non-empty lists.
+    /// Exact Hex or RubyGems package names exempt from release age and digest quarantine.
+    /// Only supported for Hex and Gems; other registry sections reject non-empty lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_exempt_packages: Vec<String>,
     /// Literal npm scope or Go module path prefixes, including the trailing slash.
@@ -340,7 +340,7 @@ impl CurationConfig {
         let Some(section) = self.registry_override(registry) else {
             return false;
         };
-        (registry == RegistryType::Hex
+        (matches!(registry, RegistryType::Hex | RegistryType::Gems)
             && section.cooldown_exempt_packages.iter().any(|p| p == name))
             || (matches!(registry, RegistryType::Npm | RegistryType::Go)
                 && section
@@ -386,8 +386,18 @@ impl CurationConfig {
                     }
                 }
                 for name in &section.cooldown_exempt_packages {
-                    if registry != RegistryType::Hex {
-                        errors.push(format!("curation.{registry}.cooldown_exempt_packages is only supported for hex"));
+                    if registry == RegistryType::Gems {
+                        if name.is_empty()
+                            || name.len() > 256
+                            || name.contains("..")
+                            || !name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                        {
+                            errors.push(format!("curation.gems.cooldown_exempt_packages: {name:?} must be an exact RubyGems package name (no wildcards or paths)"));
+                        }
+                    } else if registry != RegistryType::Hex {
+                        errors.push(format!("curation.{registry}.cooldown_exempt_packages is only supported for hex and gems"));
                     } else if name.is_empty()
                         || !name
                             .bytes()
@@ -404,6 +414,14 @@ impl CurationConfig {
 
     /// Apply environment variable overrides for curation config.
     pub(super) fn apply_env_overrides(&mut self) -> Result<(), String> {
+        if let Ok(value) = env::var("NORA_CURATION_GEMS_COOLDOWN_EXEMPT_PACKAGES") {
+            self.gems.cooldown_exempt_packages = value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
         if let Ok(value) = env::var("NORA_CURATION_HEX_COOLDOWN_EXEMPT_PACKAGES") {
             self.hex.cooldown_exempt_packages = if value.trim().is_empty() {
                 Vec::new()
@@ -546,6 +564,22 @@ impl CurationConfig {
 #[cfg(test)]
 mod prefix_tests {
     use super::*;
+
+    #[test]
+    fn gems_exemptions_are_exact_names_not_prefixes_or_patterns() {
+        let mut cfg = CurationConfig::default();
+        cfg.gems.cooldown_exempt_packages = vec!["private_gem".into(), "Acme.Tool".into()];
+        assert!(cfg.cooldown_exemption_errors().is_empty());
+        assert!(cfg.cooldown_exempt(RegistryType::Gems, "private_gem"));
+        assert!(cfg.cooldown_exempt(RegistryType::Gems, "Acme.Tool"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Gems, "private_gem_other"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Gems, "acme.tool"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Hex, "private_gem"));
+        for bad in ["", "*", "acme/*", "../secret", "a..b"] {
+            cfg.gems.cooldown_exempt_packages = vec![bad.into()];
+            assert!(!cfg.cooldown_exemption_errors().is_empty(), "{bad}");
+        }
+    }
 
     #[test]
     fn cooldown_prefixes_are_registry_specific_and_bounded() {

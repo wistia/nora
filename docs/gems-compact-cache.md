@@ -1,0 +1,83 @@
+# RubyGems compact-index caching
+
+Nora keeps RubyGems' client/CloudFront `Cache-Control` unchanged. Server-side
+retention is independent: `/info/<gem>` bodies can stay in memory for a day
+without postponing dependency updates or yanks for a day.
+
+## Freshness and replicas
+
+The last record for a gem in `/versions` gives the MD5 change identifier of its
+current `/info` document. Nora periodically refreshes a complete checksum map on
+demand, using the existing conditional upstream request and shared S3 cache.
+A monthly `/versions` rewrite replaces the map, including removed names.
+
+Each replica keeps its own map. Normal gems check its freshness against
+`gems.metadata_ttl` (300 seconds by default). Exact-name cooldown-exempt gems use
+the shorter of that interval and `gems.exempt_metadata_ttl` (60 seconds). When
+exemptions are configured, the `/versions` endpoint also uses that shorter
+interval so clients can discover exempt releases promptly. Refreshes are on
+request, not background polling.
+
+Bodies and their upstream Cache-Control are stored together at
+`.nora-gems-info/<gem>/<checksum>` in shared storage. These internal keys are
+hidden from package listings. A new checksum selects a new object; there is no
+cross-replica deletion or mutable per-gem freshness pointer. An old replica can
+serve its old snapshot within its refresh window without overwriting the newer
+body. Concurrent fills on one replica are coalesced. Different replicas may
+fetch the same body concurrently, which is safe; no distributed lock is needed.
+
+Nora checks a downloaded or shared body against its expected checksum before
+using it. A mismatch (for example while upstream CDN nodes disagree during a
+publish) returns an uncacheable 502 and discards the local checksum snapshot so
+the next request can refresh it. MD5 is the protocol's change identifier, not a
+security guarantee; existing storage integrity and artifact curation gates
+remain in force.
+
+A replica's hot body cache is bounded to 64 MiB and 4,096 entries, with a default
+one-day residence time. A matching hot entry requires no per-gem S3 operations.
+On a local miss, another replica's shared object can be reused. Existing
+`gems/info/<gem>` bodies migrate without an upstream fetch if their bytes match
+the current checksum. Shared immutable objects survive process restarts; the
+one-day setting expires memory entries, not S3 objects. Old checksum objects are
+not proactively deleted by this implementation; configure an S3 lifecycle rule
+for the internal prefix if storage retention needs a bound. Active objects can
+always be reconstructed from upstream after expiration.
+
+If `/versions` cannot be used, or it has no entry for a gem, Nora retains its
+previous `/info` TTL/ETag/Last-Modified and stale-on-error behavior. Internal
+namespace gems and offline-only registries continue to use their local copies,
+without consulting upstream `/versions`. Namespace and curation checks run
+before the hot cache is consulted.
+
+## Configuration
+
+```toml
+[gems]
+info_checksum_cache = true # default; false restores the previous /info path
+metadata_ttl = 300
+exempt_metadata_ttl = 60
+info_cache_ttl = 86400 # memory residence, not metadata freshness or HTTP max-age
+
+[curation.gems]
+cooldown_exempt_packages = ["my_internal_gem"]
+```
+
+RubyGems exemptions are exact, case-sensitive package names, not prefixes or
+globs. They bypass release-age and digest-quarantine cooldowns only; blocklists,
+allowlists, namespace isolation and integrity checks still apply. Ambiguous gem
+filenames must have every possible identity exempt before digest quarantine is
+skipped. Existing registry-wide `[curation.gems] min_release_age` overrides also
+remain supported.
+
+Environment equivalents:
+
+- `NORA_GEMS_INFO_CHECKSUM_CACHE`
+- `NORA_GEMS_METADATA_TTL`
+- `NORA_GEMS_EXEMPT_METADATA_TTL`
+- `NORA_GEMS_INFO_CACHE_TTL`
+- `NORA_CURATION_GEMS_COOLDOWN_EXEMPT_PACKAGES` (comma-separated exact names)
+
+Existing duration semantics apply: zero means immediately stale; `-1` disables
+expiry. Shorter exempt refresh settings do not lengthen an explicitly shorter
+normal TTL. Curation exemptions are read from the hot-reloaded engine, so SIGHUP
+changes take effect without clearing any body objects.

@@ -37,14 +37,14 @@ use std::time::Duration;
 
 // Extend the existing validator sidecar; old sidecars remain readable.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-struct IndexMetadata {
+pub(super) struct IndexMetadata {
     #[serde(flatten)]
-    validators: Validators,
+    pub(super) validators: Validators,
     #[serde(default)]
-    cache_control: Option<String>,
+    pub(super) cache_control: Option<String>,
 }
 
-async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
+pub(super) async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
     let key = crate::registry::validators_key(key);
     state
         .storage
@@ -55,7 +55,11 @@ async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
         .unwrap_or_default()
 }
 
-async fn write_index_metadata(storage: &crate::Storage, key: &str, metadata: &IndexMetadata) {
+pub(super) async fn write_index_metadata(
+    storage: &crate::Storage,
+    key: &str,
+    metadata: &IndexMetadata,
+) {
     if let Ok(bytes) = serde_json::to_vec(metadata) {
         let key = crate::registry::validators_key(key);
         if let Err(e) = storage.put(&key, &bytes).await {
@@ -106,10 +110,14 @@ async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
 // Keep upstream versions and info documents unchanged: their checksums refer to
 // each other. Download gates continue to enforce server-side cooldown policy.
 async fn versions_index(State(state): State<AppState>) -> Response {
-    fetch_index(&state, "versions").await
+    fetch_index_with_ttl(&state, "versions", super::gems_cache::versions_ttl(&state)).await
 }
 
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
+    fetch_index_with_ttl(state, filename, state.config.gems.metadata_ttl).await
+}
+
+pub(super) async fn fetch_index_with_ttl(state: &AppState, filename: &str, ttl: i64) -> Response {
     let content_type = if filename == "versions" {
         "text/plain; charset=utf-8"
     } else {
@@ -134,7 +142,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     let cached_data = cached_data.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
+            if is_within_ttl(meta.modified, ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit("gems");
                 state.activity.push(ActivityEntry::new(
@@ -325,6 +333,12 @@ async fn compact_index(
             crate::curation::RequestVersion::Unspecified,
             None,
         ) {
+            return response;
+        }
+    }
+
+    if !internal && upstream_url(&state).is_some() && state.config.gems.info_checksum_cache {
+        if let Some(response) = super::gems_cache::info(&state, &name).await {
             return response;
         }
     }
@@ -579,7 +593,7 @@ async fn download_gem(
     let cached_meta = state.storage.stat(&storage_key).await;
 
     // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
         state.config.curation.gems.quarantine.as_ref().or(state
             .config
             .curation
@@ -593,6 +607,15 @@ async fn download_gem(
             .as_deref()
             .or(state.config.curation.quarantine_ttl.as_deref()),
     );
+
+    if identities.iter().all(|identity| {
+        state
+            .curation()
+            .curation_engine
+            .cooldown_exempt(RegistryType::Gems, &identity.name)
+    }) {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
+    }
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. .gem files only — the specs/compact indexes are mutable. A
@@ -1610,7 +1633,7 @@ const GEM_FILE_STEM_MAX: usize = GEM_NAME_MAX + 1 + GEM_VERSION_MAX + 1 + GEM_NA
 
 /// Validate gem name: alphanumeric, hyphens, underscores, dots.
 /// No path traversal, no slashes, no null bytes.
-fn is_valid_gem_name(name: &str) -> bool {
+pub(super) fn is_valid_gem_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= GEM_NAME_MAX
         && !name.contains('/')
