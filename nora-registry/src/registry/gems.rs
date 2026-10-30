@@ -324,7 +324,11 @@ async fn compact_index_with_cache_policy(
     let exempt = state
         .curation()
         .curation_engine
-        .cooldown_exempt(RegistryType::Gems, &name);
+        .cooldown_exempt(RegistryType::Gems, &name)
+        || state
+            .curation()
+            .curation_engine
+            .has_cooldown_exempt_versions_for(RegistryType::Gems, &name);
     let ttl = if exempt {
         state
             .config
@@ -1049,9 +1053,11 @@ fn effective_quarantine(
     let curation = state.curation();
     if !identities.is_empty()
         && identities.iter().all(|identity| {
-            curation
-                .curation_engine
-                .cooldown_exempt(RegistryType::Gems, &identity.name)
+            curation.curation_engine.cooldown_exempt_version(
+                RegistryType::Gems,
+                &identity.name,
+                Some(&identity.version),
+            )
         })
     {
         q_mode = crate::digest_quarantine::QuarantineMode::Off;
@@ -4103,4 +4109,67 @@ mod gem_file_name_work {
 #[cfg(test)]
 fn compact_index_lists_text(index: &str, file: &GemFile) -> bool {
     compact_index_lists(&super::gems_cache::version_tokens(index), file)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod exact_version_cooldown_tests {
+    use crate::test_helpers::{create_test_context_with_config, quarantine_7d, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_other_policy() {
+        for (name, version, blocked) in [
+            ("example", "1.0.0", false),
+            ("example", "1.0.1", false),
+            ("other", "1.0.0", false),
+            ("example", "1.0.0", true),
+        ] {
+            let up = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GEM".to_vec()))
+                .mount(&up)
+                .await;
+            let (_dir, blocklist) = crate::test_helpers::blocklist_file("gems", "example");
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(uri);
+                quarantine_7d(cfg);
+                cfg.curation.min_release_age = Some("7d".into());
+                cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                    serde_json::json!({"name":"example","version":"1.0.0"}),
+                )
+                .unwrap()];
+                if blocked {
+                    cfg.curation.blocklist_path = Some(blocklist);
+                }
+            });
+            let expected = if name == "example" && version == "1.0.0" && !blocked {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            let uri = format!("/gems/gems/{name}-{version}.gem");
+            assert_eq!(
+                send(&ctx.app, Method::GET, &uri, "").await.status(),
+                expected
+            );
+            assert_eq!(
+                send(&ctx.app, Method::GET, &uri, "").await.status(),
+                expected
+            );
+            if expected == StatusCode::OK {
+                crate::test_helpers::reload_curation(&ctx, |cfg| {
+                    cfg.curation.gems.cooldown_exempt_versions.clear()
+                });
+                assert_eq!(
+                    send(&ctx.app, Method::GET, &uri, "").await.status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+    }
 }

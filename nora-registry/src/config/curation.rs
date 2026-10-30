@@ -144,9 +144,17 @@ pub struct CurationConfig {
     pub cpan: RegistryCurationOverride,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CooldownExemptVersion {
+    pub name: String,
+    pub version: String,
+}
+
 /// Per-registry curation override (used within `[curation.{registry}]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryCurationOverride {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldown_exempt_versions: Vec<CooldownExemptVersion>,
     /// Override min_release_age for this specific registry.
     #[serde(default)]
     pub min_release_age: Option<String>,
@@ -163,6 +171,60 @@ pub struct RegistryCurationOverride {
     /// Literal npm scope or Go module path prefixes, including the trailing slash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_exempt_prefixes: Vec<String>,
+}
+
+fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> bool {
+    let component = |value: &str| {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+    };
+    let valid_name = match registry {
+        RegistryType::Npm => {
+            name.len() <= 214
+                && if let Some(scoped) = name.strip_prefix('@') {
+                    scoped
+                        .split_once('/')
+                        .is_some_and(|(scope, package)| component(scope) && component(package))
+                } else {
+                    component(name)
+                }
+        }
+        RegistryType::Go => name.contains('.') && name.split('/').all(component),
+        RegistryType::Hex => {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        }
+        RegistryType::Gems => {
+            name.len() <= 256 && component(name) && !name.contains('~') && !name.contains("..")
+        }
+        _ => false,
+    };
+    valid_name
+        && match registry {
+            RegistryType::Npm => crate::curation::npm_version_key(version).is_some(),
+            RegistryType::Go => crate::curation::go_version_key(version).is_some(),
+            RegistryType::Hex => crate::curation::pub_version_key(version).is_some(),
+            RegistryType::Gems => {
+                version.len() <= 256
+                    && version.split('.').enumerate().all(|(index, segment)| {
+                        !segment.is_empty()
+                            && segment.bytes().all(|b| {
+                                if index == 0 {
+                                    b.is_ascii_digit()
+                                } else {
+                                    b.is_ascii_alphanumeric()
+                                }
+                            })
+                    })
+            }
+            _ => false,
+        }
 }
 
 impl Default for CurationConfig {
@@ -291,6 +353,7 @@ impl CurationConfig {
                 min_release_age: _,
                 cooldown_exempt_packages: _,
                 cooldown_exempt_prefixes: _,
+                cooldown_exempt_versions: _,
                 quarantine,
                 quarantine_ttl,
             } = own;
@@ -349,11 +412,36 @@ impl CurationConfig {
                     .any(|p| !p.is_empty() && p.ends_with('/') && name.starts_with(p)))
     }
 
+    pub fn cooldown_exempt_version(
+        &self,
+        registry: RegistryType,
+        name: &str,
+        version: Option<&str>,
+    ) -> bool {
+        self.cooldown_exempt(registry, name)
+            || version.is_some_and(|version| {
+                self.registry_override(registry).is_some_and(|section| {
+                    section.cooldown_exempt_versions.iter().any(|entry| {
+                        crate::curation::curation_name(registry, &entry.name)
+                            == crate::curation::curation_name(registry, name)
+                            && crate::curation::curation_version(registry, &entry.version)
+                                == crate::curation::curation_version(registry, version)
+                    })
+                })
+            })
+    }
+
     /// Validate exemption declarations at startup and on curation reload.
     pub fn cooldown_exemption_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for &registry in RegistryType::all() {
             if let Some(section) = self.registry_override(registry) {
+                for entry in &section.cooldown_exempt_versions {
+                    if !valid_exempt_identity(registry, &entry.name, &entry.version) {
+                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex or gems"));
+                    }
+                }
+
                 for prefix in &section.cooldown_exempt_prefixes {
                     let valid = match registry {
                         RegistryType::Npm => prefix
@@ -606,6 +694,97 @@ mod prefix_tests {
         ] {
             cfg.go.cooldown_exempt_prefixes = vec![bad.into()];
             assert!(!cfg.cooldown_exemption_errors().is_empty(), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_version_tests {
+    use super::*;
+
+    fn config(registry: RegistryType, name: &str, version: &str) -> CurationConfig {
+        let mut config = CurationConfig::default();
+        config
+            .registry_override_mut(registry)
+            .unwrap()
+            .cooldown_exempt_versions
+            .push(CooldownExemptVersion {
+                name: name.into(),
+                version: version.into(),
+            });
+        config
+    }
+
+    #[test]
+    fn exact_versions_are_registry_specific_and_normalized() {
+        for (registry, name, version, spelling, sibling) in [
+            (
+                RegistryType::Gems,
+                "example",
+                "1.2.3.pre",
+                "1.2.3.pre",
+                "1.2.4",
+            ),
+            (
+                RegistryType::Npm,
+                "@wistia/example",
+                "1.2.3",
+                "v1.2.3",
+                "1.2.4",
+            ),
+            (
+                RegistryType::Go,
+                "github.com/Example/module",
+                "v1.2",
+                "v1.2.0",
+                "v1.2.1",
+            ),
+            (RegistryType::Hex, "example", "1.2.3", "1.2.3", "1.2.4"),
+        ] {
+            let config = config(registry, name, version);
+            assert!(config.cooldown_exemption_errors().is_empty());
+            assert!(config.cooldown_exempt_version(registry, name, Some(spelling)));
+            assert!(!config.cooldown_exempt_version(registry, name, Some(sibling)));
+            assert!(!config.cooldown_exempt_version(registry, "other", Some(spelling)));
+            assert!(!config.cooldown_exempt_version(registry, name, None));
+            for other in [
+                RegistryType::Gems,
+                RegistryType::Npm,
+                RegistryType::Go,
+                RegistryType::Hex,
+            ] {
+                if registry != other {
+                    assert!(!config.cooldown_exempt_version(other, name, Some(spelling)));
+                }
+            }
+        }
+        assert!(valid_exempt_identity(
+            RegistryType::Go,
+            "github.com/example/module",
+            "v0.0.0-20260101120000-abcdef123456"
+        ));
+    }
+
+    #[test]
+    fn malformed_and_unsupported_entries_are_refused() {
+        for (registry, name, version) in [
+            (RegistryType::Go, "github.com/example/module", "1.2.3"),
+            (RegistryType::Go, "example", "v1.2.3"),
+            (RegistryType::Npm, "example", "1.x"),
+            (RegistryType::Npm, "example", "latest"),
+            (RegistryType::Npm, "@scope/*", "1.2.3"),
+            (RegistryType::Hex, "Bad/Name", "1.2.3"),
+            (RegistryType::Gems, "example", "/bad"),
+            (RegistryType::Gems, "example", "latest"),
+            (RegistryType::Gems, "example", ""),
+            (RegistryType::Cargo, "example", "1.2.3"),
+        ] {
+            assert!(
+                !config(registry, name, version)
+                    .cooldown_exemption_errors()
+                    .is_empty(),
+                "{registry}: {name}@{version}"
+            );
         }
     }
 }

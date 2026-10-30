@@ -526,11 +526,11 @@ async fn handle_request(
     }
 
     // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = if state
-        .curation()
-        .curation_engine
-        .cooldown_exempt(crate::registry_type::RegistryType::Npm, &package_name)
-    {
+    let (q_mode, q_secs) = if state.curation().curation_engine.cooldown_exempt_version(
+        crate::registry_type::RegistryType::Npm,
+        &package_name,
+        tarball_version.as_deref(),
+    ) {
         (crate::digest_quarantine::QuarantineMode::Off, 0)
     } else {
         crate::digest_quarantine::resolve_global(
@@ -12345,6 +12345,57 @@ mod cooldown_prefix_tests {
                 }
             });
             let expected = if name == "@wistia/pkg" && !blocked {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            let uri = format!("/npm{artifact}");
+            for _ in 0..2 {
+                assert_eq!(
+                    send(&ctx.app, Method::GET, &uri, "").await.status(),
+                    expected
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_other_policy() {
+        for (name, version, blocked) in [
+            ("@wistia/pkg", "1.0.0", false),
+            ("@wistia/pkg", "1.0.1", false),
+            ("@wistia-other/pkg", "1.0.0", false),
+            ("@wistia/pkg", "1.0.0", true),
+        ] {
+            let up = MockServer::start().await;
+            let artifact = format!("/{name}/-/pkg-{version}.tgz");
+            Mock::given(method("GET"))
+                .and(path(artifact.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ARTIFACT".to_vec()))
+                .mount(&up)
+                .await;
+            let date = chrono::Utc::now().to_rfc3339();
+            let metadata = serde_json::json!({"name": name, "versions": {version: {"name": name, "version": version, "dist": {"tarball": format!("{}{}", up.uri(), artifact)}}}, "time": {version: date}});
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+                .mount(&up)
+                .await;
+            let (_dir, blocklist) = crate::test_helpers::blocklist_file("npm", name);
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.npm.proxy = Some(uri);
+                cfg.server.trust_upstream_dates = true;
+                quarantine_7d(cfg);
+                cfg.curation.min_release_age = Some("7d".into());
+                cfg.curation.npm.cooldown_exempt_versions = vec![serde_json::from_value(
+                    serde_json::json!({"name":"@wistia/pkg","version":"1.0.0"}),
+                )
+                .unwrap()];
+                if blocked {
+                    cfg.curation.blocklist_path = Some(blocklist);
+                }
+            });
+            let expected = if name == "@wistia/pkg" && version == "1.0.0" && !blocked {
                 StatusCode::OK
             } else {
                 StatusCode::FORBIDDEN

@@ -430,10 +430,11 @@ async fn tarball(
             .as_deref()
             .or(cfg.quarantine_ttl.as_deref()),
     );
-    let exempt = state
-        .curation()
-        .curation_engine
-        .cooldown_exempt(RegistryType::Hex, name);
+    let exempt = state.curation().curation_engine.cooldown_exempt_version(
+        RegistryType::Hex,
+        name,
+        Some(version),
+    );
     if !exempt {
         if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
             &state.storage,
@@ -610,6 +611,53 @@ mod tests {
         .await;
         assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
         assert!(upstream_paths(&up).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_other_policy() {
+        for (name, version, blocked) in [
+            ("jason", "1.4.4", false),
+            ("jason", "1.4.5", false),
+            ("other", "1.4.4", false),
+            ("jason", "1.4.4", true),
+        ] {
+            let (_dir, blocklist) = crate::test_helpers::blocklist_file("hex", "jason");
+            let (_up, ctx) = fixture_with_policy(record(Some(now()), &checksum()), true, |cfg| {
+                cfg.curation.hex.cooldown_exempt_versions = vec![serde_json::from_value(
+                    serde_json::json!({"name":name,"version":version}),
+                )
+                .unwrap()];
+                if blocked {
+                    cfg.curation.blocklist_path = Some(blocklist);
+                }
+            })
+            .await;
+            let expected = if name == "jason" && version == "1.4.4" && !blocked {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(status(&ctx).await, expected);
+            assert_eq!(status(&ctx).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_version_exemption_reload_restores_existing_hold() {
+        let (_up, ctx) = fixture(record(None, &checksum()), true).await;
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.hex.cooldown_exempt_versions =
+                vec![
+                    serde_json::from_value(serde_json::json!({"name":"jason","version":"1.4.4"}))
+                        .unwrap(),
+                ];
+        });
+        assert_eq!(status(&ctx).await, StatusCode::OK);
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.hex.cooldown_exempt_versions.clear()
+        });
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

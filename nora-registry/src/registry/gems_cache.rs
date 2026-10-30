@@ -210,6 +210,10 @@ fn checksum_ttl(state: &AppState, name: &str) -> i64 {
         .curation()
         .curation_engine
         .cooldown_exempt(RegistryType::Gems, name)
+        || state
+            .curation()
+            .curation_engine
+            .has_cooldown_exempt_versions_for(RegistryType::Gems, name)
     {
         shorter_ttl(
             state.config.gems.metadata_ttl,
