@@ -110,7 +110,13 @@ async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
 // Keep upstream versions and info documents unchanged: their checksums refer to
 // each other. Download gates continue to enforce server-side cooldown policy.
 async fn versions_index(State(state): State<AppState>) -> Response {
-    fetch_index_with_ttl(&state, "versions", super::gems_cache::versions_ttl(&state)).await
+    let response =
+        fetch_index_with_ttl(&state, "versions", super::gems_cache::versions_ttl(&state)).await;
+    versions_cache_policy(
+        response,
+        state.config.gems.versions_stale_while_revalidate,
+        state.config.gems.versions_stale_if_error,
+    )
 }
 
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
@@ -328,10 +334,20 @@ async fn compact_index_with_cache_policy(
     } else {
         state.config.gems.info_http_max_age
     };
-    info_cache_policy(response, ttl)
+    let cfg = &state.config.gems;
+    let (swr, sie) = if exempt {
+        (
+            cfg.exempt_info_stale_while_revalidate
+                .min(cfg.info_stale_while_revalidate),
+            cfg.exempt_info_stale_if_error.min(cfg.info_stale_if_error),
+        )
+    } else {
+        (cfg.info_stale_while_revalidate, cfg.info_stale_if_error)
+    };
+    info_cache_policy(response, ttl, swr, sie)
 }
 
-fn info_cache_policy(mut response: Response, ttl: u64) -> Response {
+fn allows_stale_policy(response: &Response) -> bool {
     let restricted = response
         .headers()
         .get_all(header::CACHE_CONTROL)
@@ -346,11 +362,63 @@ fn info_cache_policy(mut response: Response, ttl: u64) -> Response {
                 })
             })
         });
-    if response.status() == StatusCode::OK
+    response.status() == StatusCode::OK
         && !response.headers().contains_key("x-nora-stale")
         && !restricted
-    {
-        if let Ok(value) = HeaderValue::from_str(&format!("public, max-age={ttl}")) {
+}
+
+fn append_stale_windows(policy: &mut String, swr: u64, sie: u64) {
+    if swr > 0 {
+        policy.push_str(&format!(", stale-while-revalidate={swr}"));
+    }
+    if sie > 0 {
+        policy.push_str(&format!(", stale-if-error={sie}"));
+    }
+}
+
+fn versions_cache_policy(mut response: Response, swr: u64, sie: u64) -> Response {
+    if !allows_stale_policy(&response) {
+        return response;
+    }
+    // Keep upstream freshness and other directives, replacing only stale windows.
+    // No upstream Cache-Control means no explicit freshness policy to extend.
+    let values: Vec<_> = response
+        .headers()
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .collect();
+    if values.is_empty() {
+        return response;
+    }
+    let mut directives = Vec::new();
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return response;
+        };
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            let name = directive.split('=').next().unwrap_or("").trim();
+            if !["stale-while-revalidate", "stale-if-error"]
+                .iter()
+                .any(|stale| name.eq_ignore_ascii_case(stale))
+            {
+                directives.push(directive.to_string());
+            }
+        }
+    }
+    let mut policy = directives.join(", ");
+    append_stale_windows(&mut policy, swr, sie);
+    if let Ok(value) = HeaderValue::from_str(&policy) {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
+fn info_cache_policy(mut response: Response, ttl: u64, swr: u64, sie: u64) -> Response {
+    if allows_stale_policy(&response) {
+        let mut policy = format!("public, max-age={ttl}");
+        append_stale_windows(&mut policy, swr, sie);
+        if let Ok(value) = HeaderValue::from_str(&policy) {
             response.headers_mut().insert(header::CACHE_CONTROL, value);
         }
     }
@@ -1836,8 +1904,14 @@ mod integration_tests {
                     cfg.curation.gems.cooldown_exempt_packages = vec!["rails".into()];
                 });
                 for (name, policy) in [
-                    ("rake", "public, max-age=86400"),
-                    ("rails", "public, max-age=60"),
+                    (
+                        "rake",
+                        "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000",
+                    ),
+                    (
+                        "rails",
+                        "public, max-age=60, stale-while-revalidate=259200, stale-if-error=432000",
+                    ),
                 ] {
                     ctx.state
                         .storage
@@ -1859,6 +1933,10 @@ mod integration_tests {
             cfg.gems.enabled = true;
             cfg.gems.proxy = None;
             cfg.gems.info_http_max_age = 120;
+            cfg.gems.info_stale_while_revalidate = 15;
+            cfg.gems.info_stale_if_error = 90;
+            cfg.gems.exempt_info_stale_while_revalidate = 5;
+            cfg.gems.exempt_info_stale_if_error = 20;
             cfg.gems.exempt_info_http_max_age = 10;
         });
         ctx.state
@@ -1869,7 +1947,7 @@ mod integration_tests {
         let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
-            "public, max-age=120"
+            "public, max-age=120, stale-while-revalidate=15, stale-if-error=90"
         );
         let mut updated = (*ctx.state.config).clone();
         updated.curation.gems.cooldown_exempt_packages = vec!["rails".into()];
@@ -1882,8 +1960,53 @@ mod integration_tests {
         let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
-            "public, max-age=10"
+            "public, max-age=10, stale-while-revalidate=5, stale-if-error=20"
         );
+    }
+
+    #[test]
+    fn versions_stale_policy_preserves_freshness_and_replaces_existing_windows() {
+        use axum::response::IntoResponse;
+        let response = || {
+            let mut response = StatusCode::OK.into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "max-age=42, public, Stale-While-Revalidate=99, stale-if-error=99"
+                    .parse()
+                    .unwrap(),
+            );
+            response
+        };
+        let updated = super::versions_cache_policy(response(), 30, 300);
+        assert_eq!(
+            updated.headers()[header::CACHE_CONTROL],
+            "max-age=42, public, stale-while-revalidate=30, stale-if-error=300"
+        );
+        let disabled = super::versions_cache_policy(response(), 0, 0);
+        assert_eq!(
+            disabled.headers()[header::CACHE_CONTROL],
+            "max-age=42, public"
+        );
+        let missing = super::versions_cache_policy(StatusCode::OK.into_response(), 30, 300);
+        assert!(!missing.headers().contains_key(header::CACHE_CONTROL));
+    }
+
+    #[test]
+    fn info_http_policy_stale_windows_are_independent_and_optional() {
+        use axum::response::IntoResponse;
+        for (swr, sie, expected) in [
+            (0, 0, "public, max-age=60"),
+            (5, 0, "public, max-age=60, stale-while-revalidate=5"),
+            (0, 10, "public, max-age=60, stale-if-error=10"),
+            (
+                5,
+                10,
+                "public, max-age=60, stale-while-revalidate=5, stale-if-error=10",
+            ),
+        ] {
+            let response = super::info_cache_policy(StatusCode::OK.into_response(), 60, swr, sie);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], expected);
+        }
     }
 
     #[test]
@@ -1894,8 +2017,15 @@ mod integration_tests {
             response
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, policy.parse().unwrap());
+            let versions = super::versions_cache_policy(response, 30, 300);
+            assert_eq!(versions.headers()[header::CACHE_CONTROL], policy);
+            let mut response = StatusCode::OK.into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, policy.parse().unwrap());
             assert_eq!(
-                super::info_cache_policy(response, 86400).headers()[header::CACHE_CONTROL],
+                super::info_cache_policy(response, 86400, 300, 86400).headers()
+                    [header::CACHE_CONTROL],
                 policy
             );
         }
@@ -1911,11 +2041,12 @@ mod integration_tests {
                     .insert("x-nora-stale", "true".parse().unwrap());
             }
             assert_eq!(
-                super::info_cache_policy(response, 86400).headers()[header::CACHE_CONTROL],
+                super::info_cache_policy(response, 86400, 300, 86400).headers()
+                    [header::CACHE_CONTROL],
                 "public, max-age=0, must-revalidate"
             );
         }
-        let response = super::info_cache_policy(StatusCode::OK.into_response(), 0);
+        let response = super::info_cache_policy(StatusCode::OK.into_response(), 0, 0, 0);
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
             "public, max-age=0"
@@ -2190,7 +2321,10 @@ mod integration_tests {
             .await;
             let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(resp.headers()[header::CACHE_CONTROL], "max-age=60, public");
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                "max-age=60, public, stale-while-revalidate=259200, stale-if-error=432000"
+            );
             assert_eq!(body_bytes(resp).await.as_ref(), index);
             upstream.verify().await;
         }
@@ -2278,9 +2412,9 @@ mod integration_tests {
             assert_eq!(
                 resp.headers()[header::CACHE_CONTROL],
                 if resource == "versions" {
-                    policy
+                    "public, max-age=42, stale-while-revalidate=259200, stale-if-error=432000"
                 } else {
-                    "public, max-age=86400"
+                    "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
                 }
             );
             assert_eq!(body_bytes(resp).await.as_ref(), b"index");
@@ -2304,9 +2438,9 @@ mod integration_tests {
             assert_eq!(
                 resp.headers()[header::CACHE_CONTROL],
                 if resource == "versions" {
-                    policy
+                    "public, max-age=42, stale-while-revalidate=259200, stale-if-error=432000"
                 } else {
-                    "public, max-age=86400"
+                    "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
                 }
             );
             assert_eq!(body_bytes(resp).await.as_ref(), b"index");
@@ -2354,9 +2488,9 @@ mod integration_tests {
             assert_eq!(
                 resp.headers()[header::CACHE_CONTROL],
                 if resource == "versions" {
-                    "max-age=90, public"
+                    "max-age=90, public, stale-while-revalidate=259200, stale-if-error=432000"
                 } else {
-                    "public, max-age=86400"
+                    "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
                 }
             );
             assert_eq!(body_bytes(resp).await.as_ref(), b"index");
@@ -2395,7 +2529,10 @@ mod integration_tests {
             resp.headers()[header::CONTENT_TYPE],
             "text/plain; charset=utf-8"
         );
-        assert_eq!(resp.headers()[header::CACHE_CONTROL], "max-age=60, public");
+        assert_eq!(
+            resp.headers()[header::CACHE_CONTROL],
+            "max-age=60, public, stale-while-revalidate=259200, stale-if-error=432000"
+        );
         assert_eq!(body_bytes(resp).await.as_ref(), index);
     }
 
