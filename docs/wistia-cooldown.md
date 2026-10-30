@@ -42,3 +42,21 @@ RubyGems also accepts exact package-name exemptions through
 not prefixes. See [RubyGems compact-index caching](gems-compact-cache.md) for the
 shorter checksum refresh interval used for exempt gems and the shared,
 checksum-keyed `/info` body cache.
+
+## Exact-version exemptions
+
+All four Wistia proxy ecosystems accept `cooldown_exempt_versions` under their
+curation section, for example:
+
+```toml
+[curation.gems]
+cooldown_exempt_versions = [{ name = "trilogy", version = "2.13.2" }]
+```
+
+Entries match exact names and versions using curation normalization, not ranges
+or globs. A match skips release-age and digest quarantine only; all other
+curation controls remain active. Existing package/prefix exemptions are additive.
+Unknown versions cannot match. Removing an entry restores ordinary cooldown
+evaluation without changing stored quarantine timestamps. RubyGems platform
+builds share their resolved release version; ambiguous artifacts require every
+identity to qualify. Configuration reload applies changes.

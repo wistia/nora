@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- Exact package/version cooldown exemptions for npm, RubyGems, Go and Hex, preserving other curation checks.
+
 ### Fixed
 - Show Hex.pm in the sidebar registry list when Hex is enabled.
 
