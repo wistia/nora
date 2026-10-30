@@ -1792,11 +1792,21 @@ mod cooldown_prefix_tests {
                 StatusCode::FORBIDDEN
             };
             let uri = format!("/go{artifact}");
+            let holders = ctx.state.storage.holders();
             for _ in 0..2 {
                 assert_eq!(
                     send(&ctx.app, Method::GET, &uri, "").await.status(),
                     expected
                 );
+                crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+                if expected == StatusCode::OK {
+                    assert!(ctx
+                        .state
+                        .storage
+                        .stat(&format!("go/{name}/@v/{version}.zip"))
+                        .await
+                        .is_some());
+                }
             }
         }
     }

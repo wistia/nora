@@ -12401,11 +12401,49 @@ mod cooldown_prefix_tests {
                 StatusCode::FORBIDDEN
             };
             let uri = format!("/npm{artifact}");
+            let holders = ctx.state.storage.holders();
             for _ in 0..2 {
                 assert_eq!(
                     send(&ctx.app, Method::GET, &uri, "").await.status(),
                     expected
                 );
+                crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+                if expected == StatusCode::OK {
+                    assert!(ctx
+                        .state
+                        .storage
+                        .stat(&format!("npm/{name}/tarballs/pkg-{version}.tgz"))
+                        .await
+                        .is_some());
+                }
+            }
+            if expected == StatusCode::OK {
+                let response = crate::test_helpers::send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    &uri,
+                    vec![("range", "bytes=0-2")],
+                    "",
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+                assert_eq!(crate::test_helpers::body_bytes(response).await, b"ART"[..]);
+                crate::test_helpers::reload_curation(&ctx, |cfg| {
+                    cfg.curation.npm.cooldown_exempt_versions.clear()
+                });
+                assert_eq!(
+                    send(&ctx.app, Method::GET, &uri, "").await.status(),
+                    StatusCode::FORBIDDEN
+                );
+                let response = crate::test_helpers::send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    &uri,
+                    vec![("range", "bytes=0-2")],
+                    "",
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
             }
         }
     }

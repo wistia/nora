@@ -614,6 +614,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_version_exemption_preserves_allowlist_restrictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("allowlist.json");
+        std::fs::write(
+            &file,
+            r#"{"version":1,"entries":[{"registry":"hex","name":"other","version":"1.4.4"}]}"#,
+        )
+        .unwrap();
+        let (up, ctx) = fixture_with_policy(record(Some(now()), &checksum()), true, |cfg| {
+            cfg.curation.hex.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"jason", "version":"1.4.4"}),
+            )
+            .unwrap()];
+            cfg.curation.allowlist_path = Some(file.to_str().unwrap().into());
+        })
+        .await;
+        assert_eq!(status(&ctx).await, StatusCode::FORBIDDEN);
+        assert!(upstream_paths(&up).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn exact_version_exemption_preserves_other_policy() {
         for (name, version, blocked) in [
             ("jason", "1.4.4", false),
@@ -639,6 +660,20 @@ mod tests {
             };
             assert_eq!(status(&ctx).await, expected);
             assert_eq!(status(&ctx).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_checksum_and_signature_checks() {
+        for body in [record(Some(now()), &[0; 32]), RECORD.to_vec()] {
+            let (_up, ctx) = fixture_with_policy(body, true, |cfg| {
+                cfg.curation.hex.cooldown_exempt_versions = vec![serde_json::from_value(
+                    serde_json::json!({"name":"jason", "version":"1.4.4"}),
+                )
+                .unwrap()];
+            })
+            .await;
+            assert_eq!(status(&ctx).await, StatusCode::BAD_GATEWAY);
         }
     }
 

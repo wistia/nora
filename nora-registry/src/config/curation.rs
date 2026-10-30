@@ -182,18 +182,26 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
     };
+    let npm_component = |value: &str| component(value) && !value.starts_with(['.', '_']);
     let valid_name = match registry {
         RegistryType::Npm => {
             name.len() <= 214
                 && if let Some(scoped) = name.strip_prefix('@') {
-                    scoped
-                        .split_once('/')
-                        .is_some_and(|(scope, package)| component(scope) && component(package))
+                    scoped.split_once('/').is_some_and(|(scope, package)| {
+                        npm_component(scope) && npm_component(package)
+                    })
                 } else {
-                    component(name)
+                    npm_component(name)
                 }
         }
-        RegistryType::Go => name.contains('.') && name.split('/').all(component),
+        RegistryType::Go => {
+            name.split('/')
+                .next()
+                .is_some_and(|host| host.contains('.'))
+                && name
+                    .split('/')
+                    .all(|part| component(part) && !part.starts_with('.') && !part.ends_with('.'))
+        }
         RegistryType::Hex => {
             !name.is_empty()
                 && name
@@ -211,7 +219,7 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
             RegistryType::Go => crate::curation::go_version_key(version).is_some(),
             RegistryType::Hex => crate::curation::pub_version_key(version).is_some(),
             RegistryType::Gems => {
-                version.len() <= 256
+                version.len() <= 128
                     && version.split('.').enumerate().all(|(index, segment)| {
                         !segment.is_empty()
                             && segment.bytes().all(|b| {
@@ -766,12 +774,28 @@ mod exact_version_tests {
     }
 
     #[test]
+    fn gem_version_length_matches_artifact_route_limit() {
+        assert!(config(RegistryType::Gems, "example", &"1".repeat(128))
+            .cooldown_exemption_errors()
+            .is_empty());
+        assert!(!config(RegistryType::Gems, "example", &"1".repeat(129))
+            .cooldown_exemption_errors()
+            .is_empty());
+    }
+
+    #[test]
     fn malformed_and_unsupported_entries_are_refused() {
         for (registry, name, version) in [
             (RegistryType::Go, "github.com/example/module", "1.2.3"),
             (RegistryType::Go, "example", "v1.2.3"),
             (RegistryType::Npm, "example", "1.x"),
             (RegistryType::Npm, "example", "latest"),
+            (RegistryType::Npm, ".example", "1.2.3"),
+            (RegistryType::Npm, "_example", "1.2.3"),
+            (RegistryType::Npm, "@.scope/example", "1.2.3"),
+            (RegistryType::Go, "example.com/.module", "v1.2.3"),
+            (RegistryType::Go, "example.com/module.", "v1.2.3"),
+            (RegistryType::Go, "localhost/module.name", "v1.2.3"),
             (RegistryType::Npm, "@scope/*", "1.2.3"),
             (RegistryType::Hex, "Bad/Name", "1.2.3"),
             (RegistryType::Gems, "example", "/bad"),

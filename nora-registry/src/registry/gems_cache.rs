@@ -781,6 +781,35 @@ async fn load_info(state: &AppState, name: &str, checksum: &str) -> FillOutcome 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn exact_version_exemption_refreshes_metadata_and_removal_restores_ttl() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.gems.metadata_ttl = 300;
+            cfg.gems.exempt_metadata_ttl = 60;
+        });
+        assert_eq!(versions_ttl(&ctx.state), 300);
+        assert_eq!(checksum_ttl(&ctx.state, "trilogy"), 300);
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"trilogy","version":"2.13.2"}),
+            )
+            .unwrap()];
+        });
+        assert_eq!(versions_ttl(&ctx.state), 60);
+        assert_eq!(checksum_ttl(&ctx.state, "trilogy"), 60);
+        assert_eq!(checksum_ttl(&ctx.state, "rails"), 300);
+        assert!(!ctx
+            .state
+            .curation()
+            .curation_engine
+            .cooldown_exempt_version(RegistryType::Gems, "trilogy", Some("2.13.1")));
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.gems.cooldown_exempt_versions.clear()
+        });
+        assert_eq!(versions_ttl(&ctx.state), 300);
+        assert_eq!(checksum_ttl(&ctx.state, "trilogy"), 300);
+    }
+
     use super::*;
     use crate::registry::gems::{write_index_metadata, IndexMetadata};
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};

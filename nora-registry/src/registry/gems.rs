@@ -1970,6 +1970,47 @@ mod integration_tests {
         );
     }
 
+    #[tokio::test]
+    async fn exact_version_exemption_updates_info_http_policy_on_reload() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            cfg.gems.info_http_max_age = 120;
+            cfg.gems.info_stale_while_revalidate = 15;
+            cfg.gems.info_stale_if_error = 90;
+            cfg.gems.exempt_info_stale_while_revalidate = 5;
+            cfg.gems.exempt_info_stale_if_error = 20;
+            cfg.gems.exempt_info_http_max_age = 10;
+        });
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"---\n1.0.0\n")
+            .await
+            .unwrap();
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=120, stale-while-revalidate=15, stale-if-error=90"
+        );
+        let mut updated = (*ctx.state.config).clone();
+        updated.curation.gems.cooldown_exempt_versions =
+            vec![
+                serde_json::from_value(serde_json::json!({"name":"rails", "version":"1.0.0"}))
+                    .unwrap(),
+            ];
+        ctx.state
+            .reloadable
+            .store(std::sync::Arc::new(crate::ReloadableConfig {
+                curation_engine: crate::build_curation_engine(&updated).unwrap(),
+                bypass_token: None,
+            }));
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=10, stale-while-revalidate=5, stale-if-error=20"
+        );
+    }
+
     #[test]
     fn versions_stale_policy_preserves_freshness_and_replaces_existing_windows() {
         use axum::response::IntoResponse;
@@ -4152,15 +4193,34 @@ mod exact_version_cooldown_tests {
             } else {
                 StatusCode::FORBIDDEN
             };
+            for platform in ["", "-x86_64-linux", "-arm64-darwin"] {
+                for uri in [
+                    format!("/gems/gems/{name}-{version}{platform}.gem"),
+                    format!("/gems/quick/Marshal.4.8/{name}-{version}{platform}.gemspec.rz"),
+                ] {
+                    let holders = ctx.state.storage.holders();
+                    assert_eq!(
+                        send(&ctx.app, Method::GET, &uri, "").await.status(),
+                        expected,
+                        "{uri}"
+                    );
+                    crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+                    if expected == StatusCode::OK {
+                        assert!(ctx
+                            .state
+                            .storage
+                            .stat(uri.trim_start_matches('/'))
+                            .await
+                            .is_some());
+                    }
+                    assert_eq!(
+                        send(&ctx.app, Method::GET, &uri, "").await.status(),
+                        expected,
+                        "{uri}"
+                    );
+                }
+            }
             let uri = format!("/gems/gems/{name}-{version}.gem");
-            assert_eq!(
-                send(&ctx.app, Method::GET, &uri, "").await.status(),
-                expected
-            );
-            assert_eq!(
-                send(&ctx.app, Method::GET, &uri, "").await.status(),
-                expected
-            );
             if expected == StatusCode::OK {
                 crate::test_helpers::reload_curation(&ctx, |cfg| {
                     cfg.curation.gems.cooldown_exempt_versions.clear()
@@ -4171,5 +4231,118 @@ mod exact_version_cooldown_tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn exact_version_exemption_requires_every_ambiguous_identity() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GEM".to_vec()))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let identities = super::gem_file_readings("evil-1-2.0-java");
+        assert!(identities.len() > 1);
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            quarantine_7d(cfg);
+            cfg.curation.min_release_age = Some("7d".into());
+        });
+        for count in [1, identities.len()] {
+            crate::test_helpers::reload_curation(&ctx, |cfg| {
+                cfg.curation.gems.cooldown_exempt_versions = identities
+                    .iter()
+                    .take(count)
+                    .map(|identity| {
+                        serde_json::from_value(
+                            serde_json::json!({"name":identity.name,"version":identity.version}),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+            });
+            let expected = if count == 1 {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            };
+            for uri in [
+                "/gems/gems/evil-1-2.0-java.gem",
+                "/gems/quick/Marshal.4.8/evil-1-2.0-java.gemspec.rz",
+            ] {
+                assert_eq!(
+                    send(&ctx.app, Method::GET, uri, "").await.status(),
+                    expected,
+                    "{uri}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_cached_gem_integrity_even_for_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, serde_json::json!({"version":1,"entries":[{"registry":"gems","name":"example","version":"1.0.0","integrity":format!("sha256:{}", "0".repeat(64))}]}).to_string()).unwrap();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            quarantine_7d(cfg);
+            cfg.curation.min_release_age = Some("7d".into());
+            cfg.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
+            cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"example","version":"1.0.0"}),
+            )
+            .unwrap()];
+        });
+        {
+            let key = "gems/gems/example-1.0.0.gem";
+            let uri = "/gems/gems/example-1.0.0.gem";
+            ctx.state.storage.put(key, b"GEM").await.unwrap();
+            assert_eq!(
+                send(&ctx.app, Method::GET, uri, "").await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                crate::test_helpers::send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    uri,
+                    vec![("range", "bytes=0-1")],
+                    ""
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    #[tokio::test]
+    async fn exact_version_exemption_does_not_serve_corrupted_cached_gemspec() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            quarantine_7d(cfg);
+            cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"example","version":"1.0.0"}),
+            )
+            .unwrap()];
+        });
+        let key = "gems/quick/Marshal.4.8/example-1.0.0.gemspec.rz";
+        let uri = "/gems/quick/Marshal.4.8/example-1.0.0.gemspec.rz";
+        ctx.state.storage.put(key, b"SPEC").await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, uri, "").await.status(),
+            StatusCode::OK
+        );
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(key),
+            b"CORRUPTED",
+        )
+        .unwrap();
+        assert!(!send(&ctx.app, Method::GET, uri, "")
+            .await
+            .status()
+            .is_success());
     }
 }
