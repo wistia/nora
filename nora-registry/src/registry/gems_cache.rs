@@ -1213,7 +1213,7 @@ mod tests {
         let result = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
         assert_eq!(
             result.headers()[header::CACHE_CONTROL],
-            "public, max-age=86400"
+            "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
         );
         assert_eq!(body_bytes(result).await.as_ref(), body.as_bytes());
         assert!(ctx
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(
             first.headers()[header::CACHE_CONTROL],
-            "public, max-age=86400"
+            "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
         );
         assert_eq!(body_bytes(first).await.as_ref(), body.as_bytes());
         let key = format!(".nora-gems-info/rails/{}", checksum(body));

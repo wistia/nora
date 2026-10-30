@@ -35,6 +35,24 @@ pub struct GemsConfig {
     /// Downstream lifetime for exact-name cooldown exemptions, in seconds.
     #[serde(default = "default_exempt_info_http_max_age")]
     pub exempt_info_http_max_age: u64,
+    /// Downstream info stale while revalidate window in seconds; zero disables it.
+    #[serde(default = "default_info_stale_while_revalidate")]
+    pub info_stale_while_revalidate: u64,
+    /// Downstream info stale if error window in seconds; zero disables it.
+    #[serde(default = "default_info_stale_if_error")]
+    pub info_stale_if_error: u64,
+    /// Downstream exempt info stale while revalidate window in seconds; zero disables it.
+    #[serde(default = "default_exempt_info_stale_while_revalidate")]
+    pub exempt_info_stale_while_revalidate: u64,
+    /// Downstream exempt info stale if error window in seconds; zero disables it.
+    #[serde(default = "default_exempt_info_stale_if_error")]
+    pub exempt_info_stale_if_error: u64,
+    /// Downstream /versions stale while revalidate window in seconds; zero disables it.
+    #[serde(default = "default_versions_stale_while_revalidate")]
+    pub versions_stale_while_revalidate: u64,
+    /// Downstream /versions stale if error window in seconds; zero disables it.
+    #[serde(default = "default_versions_stale_if_error")]
+    pub versions_stale_if_error: u64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
     /// Revalidate stale compact-index metadata with a conditional request
@@ -59,6 +77,26 @@ fn default_exempt_info_http_max_age() -> u64 {
     60
 }
 
+fn default_info_stale_while_revalidate() -> u64 {
+    259200
+}
+fn default_info_stale_if_error() -> u64 {
+    432000
+}
+fn default_exempt_info_stale_while_revalidate() -> u64 {
+    259200
+}
+fn default_exempt_info_stale_if_error() -> u64 {
+    432000
+}
+
+fn default_versions_stale_while_revalidate() -> u64 {
+    259200
+}
+fn default_versions_stale_if_error() -> u64 {
+    432000
+}
+
 fn default_gems_proxy() -> Option<String> {
     Some("https://rubygems.org".to_string())
 }
@@ -76,6 +114,12 @@ impl Default for GemsConfig {
             info_cache_ttl: default_info_cache_ttl(),
             info_http_max_age: default_info_http_max_age(),
             exempt_info_http_max_age: default_exempt_info_http_max_age(),
+            info_stale_while_revalidate: default_info_stale_while_revalidate(),
+            info_stale_if_error: default_info_stale_if_error(),
+            exempt_info_stale_while_revalidate: default_exempt_info_stale_while_revalidate(),
+            exempt_info_stale_if_error: default_exempt_info_stale_if_error(),
+            versions_stale_while_revalidate: default_versions_stale_while_revalidate(),
+            versions_stale_if_error: default_versions_stale_if_error(),
             serve_stale: true,
             revalidate: true,
         }
@@ -134,11 +178,93 @@ impl GemsConfig {
                 &mut self.exempt_info_http_max_age,
             );
         }
+        if let Ok(val) = env::var("NORA_GEMS_INFO_STALE_WHILE_REVALIDATE") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_INFO_STALE_WHILE_REVALIDATE",
+                &val,
+                &mut self.info_stale_while_revalidate,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_INFO_STALE_IF_ERROR") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_INFO_STALE_IF_ERROR",
+                &val,
+                &mut self.info_stale_if_error,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_EXEMPT_INFO_STALE_WHILE_REVALIDATE") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_EXEMPT_INFO_STALE_WHILE_REVALIDATE",
+                &val,
+                &mut self.exempt_info_stale_while_revalidate,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_EXEMPT_INFO_STALE_IF_ERROR") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_EXEMPT_INFO_STALE_IF_ERROR",
+                &val,
+                &mut self.exempt_info_stale_if_error,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_VERSIONS_STALE_WHILE_REVALIDATE") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_VERSIONS_STALE_WHILE_REVALIDATE",
+                &val,
+                &mut self.versions_stale_while_revalidate,
+            );
+        }
+        if let Ok(val) = env::var("NORA_GEMS_VERSIONS_STALE_IF_ERROR") {
+            super::super::parse_env_warn(
+                "NORA_GEMS_VERSIONS_STALE_IF_ERROR",
+                &val,
+                &mut self.versions_stale_if_error,
+            );
+        }
         if let Ok(val) = env::var("NORA_GEMS_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
         if let Ok(val) = env::var("NORA_GEMS_REVALIDATE") {
             self.revalidate = !matches!(val.as_str(), "false" | "0");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod stale_directive_tests {
+    use super::GemsConfig;
+
+    #[test]
+    fn defaults_and_old_config_enable_normal_exempt_and_versions_stale_windows() {
+        for config in [
+            GemsConfig::default(),
+            toml::from_str::<GemsConfig>("").unwrap(),
+        ] {
+            assert_eq!(config.info_stale_while_revalidate, 259200);
+            assert_eq!(config.info_stale_if_error, 432000);
+            assert_eq!(config.exempt_info_stale_while_revalidate, 259200);
+            assert_eq!(config.exempt_info_stale_if_error, 432000);
+            assert_eq!(config.versions_stale_while_revalidate, 259200);
+            assert_eq!(config.versions_stale_if_error, 432000);
+        }
+    }
+
+    #[test]
+    fn stale_windows_accept_zero_and_reject_negative_seconds() {
+        let config: GemsConfig = toml::from_str("info_stale_while_revalidate = 0\ninfo_stale_if_error = 10\nexempt_info_stale_while_revalidate = 1\nexempt_info_stale_if_error = 2").unwrap();
+        assert_eq!(config.info_stale_while_revalidate, 0);
+        assert_eq!(config.info_stale_if_error, 10);
+        assert_eq!(config.exempt_info_stale_while_revalidate, 1);
+        assert_eq!(config.exempt_info_stale_if_error, 2);
+        for field in [
+            "info_stale_while_revalidate",
+            "info_stale_if_error",
+            "exempt_info_stale_while_revalidate",
+            "exempt_info_stale_if_error",
+            "versions_stale_while_revalidate",
+            "versions_stale_if_error",
+        ] {
+            assert!(toml::from_str::<GemsConfig>(&format!("{field} = -1")).is_err());
         }
     }
 }

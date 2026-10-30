@@ -1,15 +1,40 @@
 # RubyGems compact-index caching
 
-Successful `/info/<gem>` responses advertise `Cache-Control: public, max-age=86400`
-by default. Exact-name cooldown-exempt gems use `public, max-age=60` (capped by
-the normal lifetime). This downstream policy applies to fresh fetches, memory and
+Successful `/info/<gem>` responses advertise
+`Cache-Control: public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000`
+by default. Exact-name cooldown-exempt gems use
+`public, max-age=60, stale-while-revalidate=259200, stale-if-error=432000`.
+The exempt fresh lifetime and stale windows are capped by their normal counterparts.
+This downstream policy applies to fresh fetches, memory and
 shared-storage hits, legacy metadata, and offline copies. Stale fallbacks and
 errors do not receive the long lifetime; explicit upstream `private`, `no-store`
-or `no-cache` directives remain respected. `/versions` retains upstream headers.
+or `no-cache` directives remain respected. `/versions` preserves upstream fresh
+TTL and other directives while replacing stale windows with configured values:
+three days for stale-while-revalidate and five days for stale-if-error by
+default. An upstream response without Cache-Control remains without it.
+
+`stale-while-revalidate` allows a downstream cache to serve expired metadata
+while refreshing it asynchronously; `stale-if-error` lets it reuse expired
+metadata when the origin is unreachable or returns a supported server error.
+Both windows start when `max-age` expires, independently. Ordinary gems default
+to three days and five days respectively. Zero disables the corresponding
+advertised directive. Exempt gems default to three days and five days.
+Exempt windows are configurable separately and capped by
+the corresponding normal window, so exemptions cannot extend downstream staleness.
+These directives delegate refresh/error handling to downstream caches; they do
+not add background jobs or cross-replica coordination inside Nora. Origin-side
+`serve_stale` remains independent, and origin stale fallbacks still advertise
+`max-age=0, must-revalidate` without the stale extensions.
+
+[CloudFront supports both directives](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html)
+but limits stale retention by the cache behavior's Maximum TTL. Configure that
+limit to accommodate the desired fresh and stale lifetimes.
 
 HTTP lifetime is separate from memory retention and checksum refresh intervals.
-A CDN or client can retain an ordinary gem's metadata for a day, including an old
-view of yanks or corrections. Adding an exemption affects new origin responses;
+An ordinary gem is fresh for one day; the stale windows allow up to four days
+of total age during revalidation or six days during an outage. Yanks and
+corrections can remain absent from the cached view during these windows.
+Adding an exemption affects new origin responses;
 already cached responses expire at their original TTL unless invalidated.
 
 ## Freshness and replicas
@@ -120,6 +145,12 @@ exempt_metadata_ttl = 60
 info_cache_ttl = 86400 # memory residence, not metadata freshness or HTTP max-age
 info_http_max_age = 86400 # downstream /info lifetime, seconds
 exempt_info_http_max_age = 60 # capped by info_http_max_age
+info_stale_while_revalidate = 259200
+info_stale_if_error = 432000
+exempt_info_stale_while_revalidate = 259200
+exempt_info_stale_if_error = 432000
+versions_stale_while_revalidate = 259200
+versions_stale_if_error = 432000
 
 [curation.gems]
 cooldown_exempt_packages = ["my_internal_gem"]
@@ -141,6 +172,12 @@ Environment equivalents:
 - `NORA_GEMS_INFO_CACHE_TTL`
 - `NORA_GEMS_INFO_HTTP_MAX_AGE`
 - `NORA_GEMS_EXEMPT_INFO_HTTP_MAX_AGE`
+- `NORA_GEMS_INFO_STALE_WHILE_REVALIDATE`
+- `NORA_GEMS_INFO_STALE_IF_ERROR`
+- `NORA_GEMS_EXEMPT_INFO_STALE_WHILE_REVALIDATE`
+- `NORA_GEMS_EXEMPT_INFO_STALE_IF_ERROR`
+- `NORA_GEMS_VERSIONS_STALE_WHILE_REVALIDATE`
+- `NORA_GEMS_VERSIONS_STALE_IF_ERROR`
 - `NORA_CURATION_GEMS_COOLDOWN_EXEMPT_PACKAGES` (comma-separated exact names)
 
 HTTP max-age settings accept nonnegative seconds; zero requires revalidation.
