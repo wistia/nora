@@ -3170,3 +3170,41 @@ mod maven_version_metadata_identity {
         }
     }
 }
+
+#[cfg(test)]
+mod shared_maven_quarantine_regression {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn cached_artifact_is_held_consistently_across_replicas() {
+        let storage = crate::Storage::in_memory();
+        storage
+            .put("maven/org/example/demo/1.0/demo-1.0.pom", b"same artifact")
+            .await
+            .unwrap();
+        let config = |cfg: &mut crate::config::Config| {
+            cfg.maven.proxies.clear();
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+        };
+        let first = create_test_context_with_storage_and_config(storage.clone(), config);
+        let second = create_test_context_with_storage_and_config(storage.clone(), config);
+        let uri = "/maven2/org/example/demo/1.0/demo-1.0.pom";
+        let (a, b) = tokio::join!(
+            send(&first.app, Method::GET, uri, ""),
+            send(&second.app, Method::GET, uri, "")
+        );
+        assert_eq!(a.status(), StatusCode::FORBIDDEN);
+        assert_eq!(b.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            storage
+                .list_internal(".nora-quarantine/maven/")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
