@@ -260,10 +260,18 @@ fn url_is_maven_central(value: &str) -> bool {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CentralDateKind {
+    LastModified,
+    SearchIndex,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CentralArtifactDate {
     source: String,
     digest: String,
     timestamp: i64,
+    kind: CentralDateKind,
 }
 
 fn valid_release_timestamp(timestamp: i64) -> bool {
@@ -369,8 +377,8 @@ async fn record_central_date(
         .and_then(|h| chrono::DateTime::parse_from_rfc2822(h).ok())
         .map(|d| d.timestamp())
         .filter(|&t| valid_release_timestamp(t));
-    let timestamp = match header_date {
-        Some(date) => date,
+    let (timestamp, kind) = match header_date {
+        Some(date) => (date, CentralDateKind::LastModified),
         None => {
             let miss_key = format!("{key}.retry");
             if let Ok(data) = state.storage.get(&miss_key).await {
@@ -390,7 +398,7 @@ async fn record_central_date(
             )
             .await
             {
-                Some(timestamp) => timestamp,
+                Some(timestamp) => (timestamp, CentralDateKind::SearchIndex),
                 None => {
                     // A transient search failure is retried after 30s, never a
                     // permanent negative date. A good HTTP date bypasses it.
@@ -406,6 +414,7 @@ async fn record_central_date(
         source: source.as_str().to_string(),
         digest: hex::encode(sha2::Sha256::digest(bytes)),
         timestamp,
+        kind,
     };
     if !valid_date_record(&record, path, bytes) {
         return None;
@@ -3560,6 +3569,7 @@ mod central_date_evidence_tests {
             source: format!("https://repo1.maven.org/maven2/{path}"),
             digest: hex::encode(sha2::Sha256::digest(bytes)),
             timestamp: chrono::Utc::now().timestamp() + 3600,
+            kind: CentralDateKind::LastModified,
         };
         assert!(!valid_date_record(&record, path, bytes));
         record.timestamp = -1;
