@@ -639,7 +639,7 @@ mod curation_refusal_audit_tests {
         for (uri, headers, actor) in [
             ("/raw/secret.txt", alice(), "alice"),
             ("/raw/secret.txt", bob(), "bob"),
-            ("/pypi/simple/internal-secret/", alice(), "alice"),
+            ("/simple/internal-secret/", alice(), "alice"),
         ] {
             let resp =
                 crate::test_helpers::send_with_headers(&ctx.app, Method::GET, uri, headers, "")

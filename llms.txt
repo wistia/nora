@@ -170,7 +170,7 @@ cd nora && cargo build --release
 | `/v2/` | Docker Registry v2 API |
 | `/maven2/` | Maven repository |
 | `/npm/` | npm registry |
-| `/pypi/simple/` | PyPI (PEP 503/691) |
+| `/simple/` | PyPI (PEP 503/691) |
 | `/cargo/` | Cargo sparse index |
 | `/go/` | Go module proxy |
 | `/raw/` | Raw file storage |

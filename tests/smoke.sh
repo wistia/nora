@@ -147,10 +147,10 @@ check "Maven proxy download" \
 echo ""
 echo "--- PyPI ---"
 check "PyPI simple index" \
-    curl -sf "$BASE/pypi/simple/"
+    curl -sf "$BASE/simple/"
 
 check "PyPI package page" \
-    curl -sf "$BASE/pypi/simple/requests/"
+    curl -sf "$BASE/simple/requests/"
 
 echo ""
 echo "--- Docker ---"

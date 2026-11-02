@@ -86,7 +86,7 @@ curl -sf "http://127.0.0.1:${NORA_PORT}/health" >/dev/null || { cat "$WORK/nora.
 
 # ── 1. The PEP 691 JSON itself ──
 curl -sf -H 'Accept: application/vnd.pypi.simple.v1+json' \
-    "http://127.0.0.1:${NORA_PORT}/pypi/simple/nora-hashless/" >"$WORK/index.json"
+    "http://127.0.0.1:${NORA_PORT}/simple/nora-hashless/" >"$WORK/index.json"
 if python3 - "$WORK/index.json" <<'PY'
 import json, sys
 files = json.load(open(sys.argv[1]))["files"]
@@ -112,7 +112,7 @@ dependencies = ["nora-hashless==1.0.0"]
 [tool.uv]
 package = false
 EOF
-INDEX="http://127.0.0.1:${NORA_PORT}/pypi/simple/"
+INDEX="http://127.0.0.1:${NORA_PORT}/simple/"
 if (cd "$WORK/proj" && "$UV" lock --default-index "$INDEX") >"$WORK/uv-lock.log" 2>&1; then
     pass "uv lock through NORA"
 else

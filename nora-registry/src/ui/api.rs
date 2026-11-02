@@ -34,7 +34,6 @@ pub struct RegistryStats {
     pub ansible: usize,
     #[serde(rename = "pub")]
     pub pub_dart: usize,
-    pub hex: usize,
     pub conan: usize,
     pub rpm: usize,
     pub deb: usize,
@@ -178,7 +177,6 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         terraform: get(RegistryType::Terraform),
         ansible: get(RegistryType::Ansible),
         pub_dart: get(RegistryType::PubDart),
-        hex: get(RegistryType::Hex),
         conan: get(RegistryType::Conan),
         rpm: get(RegistryType::Rpm),
         deb: get(RegistryType::Deb),
@@ -266,7 +264,6 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
                 RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
                 RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-                RegistryType::Hex => state.config.hex.proxy.clone().into_iter().collect(),
                 RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
                 RegistryType::Rpm => vec![],
                 RegistryType::Deb => vec![],
@@ -630,15 +627,6 @@ pub async fn get_npm_detail(
 ) -> PackageDetail {
     let metadata_key = crate::registry::npm::packument_key_for_reading(storage, name).await;
 
-    // One listing supplies cache status and sizes for every version. A HEAD per
-    // packument version makes large package pages painfully slow on S3.
-    let tarballs = format!("npm/{}/tarballs/", name);
-    let stored = storage.list_with_meta(&tarballs).await.unwrap_or_default();
-    let cached_tarballs: std::collections::HashMap<_, _> = stored
-        .iter()
-        .map(|(key, meta)| (key.as_str(), meta))
-        .collect();
-
     let mut stable_versions = Vec::new();
     let mut prerelease_count: usize = 0;
     // Every version the packument names, shown or not, so a stored tarball adds only the rest.
@@ -674,7 +662,7 @@ pub async fn get_npm_detail(
                         }
                     }
 
-                    // Check the listing for a cached tarball
+                    // Check if tarball is actually cached on disk
                     // For scoped packages (@scope/name), tarball uses just the "name" part
                     let name_part = if name.contains('/') {
                         name.rsplit('/').next().unwrap_or(name)
@@ -683,12 +671,11 @@ pub async fn get_npm_detail(
                     };
                     let tarball_key =
                         format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
-                    let (size, cached) =
-                        if let Some(meta) = cached_tarballs.get(tarball_key.as_str()) {
-                            (meta.size, true)
-                        } else {
-                            (meta_size, false)
-                        };
+                    let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
+                        (meta.size, true)
+                    } else {
+                        (meta_size, false)
+                    };
 
                     stable_versions.push(VersionInfo {
                         version: version.clone(),
@@ -704,7 +691,8 @@ pub async fn get_npm_detail(
     // A tarball stored without its packument is a stored version too: a lockfile install
     // fetches tarballs only, and with release dates off no packument is cached. List every
     // stored tarball of this package the packument does not name.
-    {
+    let tarballs = format!("npm/{}/tarballs/", name);
+    if let Ok(stored) = storage.list_with_meta(&tarballs).await {
         let files = stored
             .into_iter()
             .filter_map(|(key, meta)| Some((key.strip_prefix(&tarballs)?.to_string(), meta)));
@@ -1152,13 +1140,12 @@ pub async fn get_go_detail(
 /// Generic detail for new-format registries (NuGet, Gems, Terraform, Ansible, Pub, Conan).
 /// Reads version info from storage using registry-specific paths.
 pub async fn get_generic_detail(
-    state: &AppState,
+    storage: &Storage,
     registry: &str,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
-    let storage = &state.storage;
     let name_lower = name.to_lowercase();
 
     match RegistryType::from_str_opt(registry) {
@@ -1170,9 +1157,8 @@ pub async fn get_generic_detail(
         }
         Some(RegistryType::Rpm) => get_rpm_detail(storage, name, show_all).await,
         Some(RegistryType::Deb) => get_deb_detail(storage, name, show_all).await,
-        Some(RegistryType::Gems) => get_gems_detail(state, name, show_prerelease, show_all).await,
-        Some(RegistryType::Hex) => {
-            get_hex_detail(storage, &name_lower, show_prerelease, show_all).await
+        Some(RegistryType::Gems) => {
+            get_gems_detail(storage, &name_lower, show_prerelease, show_all).await
         }
         Some(RegistryType::PubDart) => {
             get_pub_detail(storage, &name_lower, show_prerelease, show_all).await
@@ -1534,106 +1520,54 @@ async fn get_deb_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
 }
 
 async fn get_gems_detail(
-    state: &AppState,
+    storage: &Storage,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
-    let storage = &state.storage;
-    let prefix = format!("gems/gems/{name}-");
-    let (info, stored) = tokio::join!(
-        crate::registry::gems_cache::cached_info(state, name),
-        storage.list_with_meta(&prefix)
-    );
-    let stored = stored.unwrap_or_default();
-    let (tokens, info_ts) = match info {
-        crate::registry::gems_cache::CachedInfo::Managed {
-            document,
-            checked_at,
-            ..
-        } => (
-            document.map_or_else(std::collections::HashSet::new, |document| {
-                document.versions().clone()
-            }),
-            if checked_at > 0 {
-                format_timestamp(checked_at)
-            } else {
-                "N/A".into()
-            },
-        ),
-        crate::registry::gems_cache::CachedInfo::Legacy => {
-            let key = format!("gems/info/{name}");
-            let (body, metadata) = tokio::join!(storage.get(&key), storage.stat(&key));
-            (
-                body.ok()
-                    .map_or_else(std::collections::HashSet::new, |body| {
-                        crate::registry::gems_cache::version_tokens(&String::from_utf8_lossy(&body))
-                    }),
-                metadata.map_or_else(|| "N/A".into(), |meta| format_timestamp(meta.modified)),
-            )
-        }
-    };
-    let cached: std::collections::HashMap<_, _> = stored
-        .iter()
-        .map(|(key, meta)| (key.as_str(), meta))
-        .collect();
-    let mut listed = std::collections::HashSet::new();
+    // Read compact index: gems/info/{name}
+    // Format: "VERSION DEPS|checksum:HEX" per line, first line is "---"
+    let info_key = format!("gems/info/{}", name);
+    let info_ts = storage
+        .stat(&info_key)
+        .await
+        .map(|m| format_timestamp(m.modified))
+        .unwrap_or_else(|| "N/A".to_string());
+
     let mut versions = Vec::new();
 
-    for version in tokens {
-        listed.insert(version.clone());
-        // Check if .gem is cached
-        let gem_key = format!("gems/gems/{}-{}.gem", name, version);
-        let (size, published, cached) = if let Some(meta) = cached.get(gem_key.as_str()) {
-            (meta.size, format_timestamp(meta.modified), true)
-        } else {
-            (0, info_ts.clone(), false)
-        };
+    if let Ok(data) = storage.get(&info_key).await {
+        if let Ok(text) = String::from_utf8(data.to_vec()) {
+            for line in text.lines() {
+                if line.starts_with('-') || line.is_empty() {
+                    continue;
+                }
+                // "1.3.0 deps...|checksum:..." — version is first token
+                let version = match line.split_whitespace().next() {
+                    Some(v) if !v.is_empty() => v.to_string(),
+                    _ => continue,
+                };
 
-        versions.push(VersionInfo {
-            version,
-            size,
-            published,
-            cached,
-        });
-    }
+                // Check if .gem is cached
+                let gem_key = format!("gems/gems/{}-{}.gem", name, version);
+                let (size, published, cached) = if let Some(meta) = storage.stat(&gem_key).await {
+                    (meta.size, format_timestamp(meta.modified), true)
+                } else {
+                    (0, info_ts.clone(), false)
+                };
 
-    // A lockfile install can cache .gem files without ever fetching /info/name.
-    for (key, meta) in &stored {
-        let Some(stem) = key
-            .strip_prefix("gems/gems/")
-            .and_then(|s| s.strip_suffix(".gem"))
-        else {
-            continue;
-        };
-        if stem.contains('/')
-            || !crate::registry::gems::split_gem_filename(stem)
-                .is_some_and(|(package, _)| package == name)
-        {
-            continue;
-        }
-        let Some(version) = stem.strip_prefix(&format!("{name}-")) else {
-            continue;
-        };
-        if listed.insert(version.to_owned()) {
-            versions.push(VersionInfo {
-                version: version.to_owned(),
-                size: meta.size,
-                published: format_timestamp(meta.modified),
-                cached: true,
-            });
+                versions.push(VersionInfo {
+                    version,
+                    size,
+                    published,
+                    cached,
+                });
+            }
         }
     }
-    versions.sort_by(|a, b| {
-        let parts = |v: &str| {
-            v.split(|c: char| !c.is_ascii_digit())
-                .filter_map(|s| s.parse::<u64>().ok())
-                .collect::<Vec<_>>()
-        };
-        parts(&b.version)
-            .cmp(&parts(&a.version))
-            .then_with(|| b.version.cmp(&a.version))
-    });
+
+    // Reverse: newest first (compact index is chronological)
+    versions.reverse();
     let (versions, prerelease_count, total_stable) =
         apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
@@ -1890,38 +1824,6 @@ pub async fn get_cpan_detail(
 }
 
 /// Fallback: scan storage for files matching {registry}/{name}/*
-async fn get_hex_detail(
-    storage: &Storage,
-    name: &str,
-    show_prerelease: bool,
-    show_all: bool,
-) -> PackageDetail {
-    let prefix = format!("hex/tarballs/{name}-");
-    let mut versions = Vec::new();
-    for (key, meta) in storage.list_with_meta(&prefix).await.unwrap_or_default() {
-        if let Some(version) = key
-            .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(".tar"))
-        {
-            versions.push(VersionInfo {
-                version: version.to_owned(),
-                size: meta.size,
-                published: format_timestamp(meta.modified),
-                cached: true,
-            });
-        }
-    }
-    versions.sort_by(|a, b| b.version.cmp(&a.version));
-    let (versions, prerelease_count, total_stable) =
-        apply_prerelease_filter(versions, show_prerelease, show_all);
-    PackageDetail {
-        versions,
-        prerelease_count,
-        total_stable,
-        metadata: PackageMetadata::default(),
-    }
-}
-
 async fn get_storage_scan_detail(
     storage: &Storage,
     registry: &str,
@@ -2524,72 +2426,5 @@ mod registry_stats_cover_every_registry {
             .map(|rt| rt.as_str().to_string())
             .collect();
         assert_eq!(keys, names);
-    }
-}
-
-#[cfg(test)]
-mod gems_detail_cache_tests {
-    use super::*;
-    #[tokio::test]
-    async fn gem_only_installs_and_compact_index_merge_without_duplicates() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = Storage::new_local(dir.path().to_str().unwrap());
-        storage
-            .put("gems/gems/net-smtp-0.5.2.gem", b"gem")
-            .await
-            .unwrap();
-        storage
-            .put("gems/gems/net-smtp-extra-1.0.0.gem", b"other")
-            .await
-            .unwrap();
-        let mut ctx = crate::test_helpers::create_test_context();
-        ctx.state.storage = storage.clone();
-        let detail = get_gems_detail(&ctx.state, "net-smtp", true, true).await;
-        assert_eq!(detail.versions.len(), 1);
-        assert_eq!(detail.versions[0].version, "0.5.2");
-        assert!(detail.versions[0].cached);
-        storage
-            .put(
-                "gems/info/net-smtp",
-                b"created_at: today\n---\n0.5.2 deps|checksum:abc\n0.6.0 deps|checksum:def\n",
-            )
-            .await
-            .unwrap();
-        let detail = get_gems_detail(&ctx.state, "net-smtp", true, true).await;
-        assert_eq!(detail.versions.len(), 2);
-        assert_eq!(detail.versions[0].version, "0.6.0");
-        assert!(!detail.versions[0].cached);
-        assert!(detail.versions[1].cached);
-    }
-}
-
-#[cfg(test)]
-mod object_store_detail_tests {
-    use super::*;
-    #[tokio::test]
-    async fn hex_and_gem_details_find_cached_versions_in_object_storage() {
-        let storage = Storage::from_backend(std::sync::Arc::new(
-            crate::storage::ObjectStorage::in_memory(),
-        ));
-        storage
-            .put("hex/tarballs/jason-1.4.4.tar", b"archive")
-            .await
-            .unwrap();
-        storage
-            .put("gems/gems/net-smtp-0.5.2.gem", b"gem")
-            .await
-            .unwrap();
-        for (registry, name, version, size) in [
-            ("hex", "jason", "1.4.4", 7),
-            ("gems", "net-smtp", "0.5.2", 3),
-        ] {
-            let mut ctx = crate::test_helpers::create_test_context();
-            ctx.state.storage = storage.clone();
-            let detail = get_generic_detail(&ctx.state, registry, name, true, true).await;
-            assert_eq!(detail.versions.len(), 1);
-            assert_eq!(detail.versions[0].version, version);
-            assert_eq!(detail.versions[0].size, size);
-            assert!(detail.versions[0].cached);
-        }
     }
 }

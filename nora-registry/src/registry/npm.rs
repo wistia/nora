@@ -526,13 +526,7 @@ async fn handle_request(
     }
 
     // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = if state.curation().curation_engine.cooldown_exempt_version(
-        crate::registry_type::RegistryType::Npm,
-        &package_name,
-        tarball_version.as_deref(),
-    ) {
-        (crate::digest_quarantine::QuarantineMode::Off, 0)
-    } else {
+    let (q_mode, q_secs) =
         crate::digest_quarantine::resolve_global(
             state.config.curation.npm.quarantine.as_ref().or(state
                 .config
@@ -544,8 +538,7 @@ async fn handle_request(
                 .curation
                 .quarantine_ttl
                 .as_deref()),
-        )
-    };
+        );
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. Tarballs only — a packument is mutable and has a TTL. A
@@ -675,8 +668,7 @@ async fn handle_request(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
-            &state.storage,
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "npm",
             &data,
@@ -687,9 +679,7 @@ async fn handle_request(
                 state.config.server.trust_upstream_dates,
                 publish_date,
             ),
-        )
-        .await
-        {
+        ) {
             return resp;
         }
         let mut response = with_content_type(true, data).into_response();
@@ -800,8 +790,19 @@ async fn handle_request(
                 });
 
                 if is_tarball {
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
-                        &state.storage,
+                    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                        state.config.curation.npm.quarantine.as_ref().or(state
+                            .config
+                            .curation
+                            .quarantine
+                            .as_ref()),
+                        state.config.curation.npm.quarantine_ttl.as_deref().or(state
+                            .config
+                            .curation
+                            .quarantine_ttl
+                            .as_deref()),
+                    );
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                         &state.digest_store,
                         "npm",
                         &data_to_serve,
@@ -812,9 +813,7 @@ async fn handle_request(
                             state.config.server.trust_upstream_dates,
                             publish_date,
                         ),
-                    )
-                    .await
-                    {
+                    ) {
                         return resp;
                     }
                 }
@@ -12300,151 +12299,5 @@ mod upstream_dates_gate {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod cooldown_prefix_tests {
-    use crate::test_helpers::{create_test_context_with_config, quarantine_7d, send};
-    use axum::http::{Method, StatusCode};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[tokio::test]
-    async fn cooldown_prefix_exemption_preserves_other_policy() {
-        for (name, blocked) in [
-            ("@wistia/pkg", false),
-            ("@wistia-other/pkg", false),
-            ("@wistia/pkg", true),
-        ] {
-            let up = MockServer::start().await;
-            let artifact = format!("/{name}/-/pkg-1.0.0.tgz");
-            Mock::given(method("GET"))
-                .and(path(artifact.clone()))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ARTIFACT".to_vec()))
-                .mount(&up)
-                .await;
-            let date = chrono::Utc::now().to_rfc3339();
-            let metadata = serde_json::json!({"name": name, "versions": {"1.0.0": {"name": name, "version": "1.0.0", "dist": {"tarball": format!("{}{}", up.uri(), artifact)}}}, "time": {"1.0.0": date}});
-            Mock::given(method("GET"))
-                .and(path(format!("/{name}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-                .mount(&up)
-                .await;
-            let (_dir, blocklist) = crate::test_helpers::blocklist_file("npm", name);
-            let uri = up.uri();
-            let ctx = create_test_context_with_config(move |cfg| {
-                cfg.npm.proxy = Some(uri);
-                cfg.server.trust_upstream_dates = true;
-                quarantine_7d(cfg);
-                cfg.curation.min_release_age = Some("7d".into());
-                cfg.curation.npm.cooldown_exempt_prefixes = vec!["@wistia/".into()];
-                if blocked {
-                    cfg.curation.blocklist_path = Some(blocklist);
-                }
-            });
-            let expected = if name == "@wistia/pkg" && !blocked {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            };
-            let uri = format!("/npm{artifact}");
-            for _ in 0..2 {
-                assert_eq!(
-                    send(&ctx.app, Method::GET, &uri, "").await.status(),
-                    expected
-                );
-            }
-        }
-    }
-    #[tokio::test]
-    async fn exact_version_exemption_preserves_other_policy() {
-        for (name, version, blocked) in [
-            ("@wistia/pkg", "1.0.0", false),
-            ("@wistia/pkg", "1.0.1", false),
-            ("@wistia-other/pkg", "1.0.0", false),
-            ("@wistia/pkg", "1.0.0", true),
-        ] {
-            let up = MockServer::start().await;
-            let artifact = format!("/{name}/-/pkg-{version}.tgz");
-            Mock::given(method("GET"))
-                .and(path(artifact.clone()))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ARTIFACT".to_vec()))
-                .mount(&up)
-                .await;
-            let date = chrono::Utc::now().to_rfc3339();
-            let metadata = serde_json::json!({"name": name, "versions": {version: {"name": name, "version": version, "dist": {"tarball": format!("{}{}", up.uri(), artifact)}}}, "time": {version: date}});
-            Mock::given(method("GET"))
-                .and(path(format!("/{name}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-                .mount(&up)
-                .await;
-            let (_dir, blocklist) = crate::test_helpers::blocklist_file("npm", name);
-            let uri = up.uri();
-            let ctx = create_test_context_with_config(move |cfg| {
-                cfg.npm.proxy = Some(uri);
-                cfg.server.trust_upstream_dates = true;
-                quarantine_7d(cfg);
-                cfg.curation.min_release_age = Some("7d".into());
-                cfg.curation.npm.cooldown_exempt_versions = vec![serde_json::from_value(
-                    serde_json::json!({"name":"@wistia/pkg","version":"1.0.0"}),
-                )
-                .unwrap()];
-                if blocked {
-                    cfg.curation.blocklist_path = Some(blocklist);
-                }
-            });
-            let expected = if name == "@wistia/pkg" && version == "1.0.0" && !blocked {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            };
-            let uri = format!("/npm{artifact}");
-            let holders = ctx.state.storage.holders();
-            for _ in 0..2 {
-                assert_eq!(
-                    send(&ctx.app, Method::GET, &uri, "").await.status(),
-                    expected
-                );
-                crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
-                if expected == StatusCode::OK {
-                    assert!(ctx
-                        .state
-                        .storage
-                        .stat(&format!("npm/{name}/tarballs/pkg-{version}.tgz"))
-                        .await
-                        .is_some());
-                }
-            }
-            if expected == StatusCode::OK {
-                let response = crate::test_helpers::send_with_headers(
-                    &ctx.app,
-                    Method::GET,
-                    &uri,
-                    vec![("range", "bytes=0-2")],
-                    "",
-                )
-                .await;
-                assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-                assert_eq!(crate::test_helpers::body_bytes(response).await, b"ART"[..]);
-                crate::test_helpers::reload_curation(&ctx, |cfg| {
-                    cfg.curation.npm.cooldown_exempt_versions.clear()
-                });
-                assert_eq!(
-                    send(&ctx.app, Method::GET, &uri, "").await.status(),
-                    StatusCode::FORBIDDEN
-                );
-                let response = crate::test_helpers::send_with_headers(
-                    &ctx.app,
-                    Method::GET,
-                    &uri,
-                    vec![("range", "bytes=0-2")],
-                    "",
-                )
-                .await;
-                assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            }
-        }
     }
 }

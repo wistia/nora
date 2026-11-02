@@ -73,7 +73,7 @@ async fn handle(
         let version = file
             .strip_prefix("@v/")
             .and_then(|f| f.strip_suffix(".zip"))
-            .and_then(|v| decode_module_path(v).ok());
+            .map(|v| v.to_string());
         Some((module_name, version))
     } else {
         None
@@ -84,37 +84,9 @@ async fn handle(
     let mut publish_date: Option<i64> = None;
     // Curation check — .zip downloads only (metadata passes through)
     if let Some((ref module_name, ref version)) = go_curation {
-        // Apply date-independent policy before making any metadata request.
-        if !crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Go,
-            module_name,
-        ) {
-            if let Some(response) = crate::curation::check_download(
-                &state.curation().curation_engine,
-                state.bypass_token().as_deref(),
-                &headers,
-                crate::curation::RegistryType::Go,
-                module_name,
-                crate::curation::RequestVersion::of_artifact(version.as_deref()),
-                None,
-            ) {
-                return response;
-            }
-        }
-        // Go clients may request the ZIP before .info (including with a lockfile).
-        // Prime metadata synchronously before either age or digest quarantine checks.
+        // Extract publish date from cached .info file
         publish_date = if let Some(ref ver) = version {
-            let encoded_version = encode_module_path(ver);
-            let info_key = format!("go/{}/@v/{}.info", module_encoded, encoded_version);
-            ensure_go_info_cached(
-                &state,
-                &module_encoded,
-                module_name,
-                &encoded_version,
-                &info_key,
-            )
-            .await;
+            let info_key = format!("go/{}/@v/{}.info", module_encoded, ver);
             extract_go_publish_date(
                 &state.storage,
                 &info_key,
@@ -202,30 +174,19 @@ async fn handle(
             // Quarantine only the .zip module archive (the artifact). The
             // .info/.mod/@v/list/@latest endpoints serve metadata — never gate them.
             if ends_with_ci(&file, ".zip") {
-                let (q_mode, q_secs) = if state.curation().curation_engine.cooldown_exempt_version(
-                    crate::registry_type::RegistryType::Go,
-                    &module_path,
-                    go_curation
-                        .as_ref()
-                        .and_then(|(_, version)| version.as_deref()),
-                ) {
-                    (crate::digest_quarantine::QuarantineMode::Off, 0)
-                } else {
-                    crate::digest_quarantine::resolve_global(
-                        state.config.curation.go.quarantine.as_ref().or(state
-                            .config
-                            .curation
-                            .quarantine
-                            .as_ref()),
-                        state.config.curation.go.quarantine_ttl.as_deref().or(state
-                            .config
-                            .curation
-                            .quarantine_ttl
-                            .as_deref()),
-                    )
-                };
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
-                    &state.storage,
+                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                    state.config.curation.go.quarantine.as_ref().or(state
+                        .config
+                        .curation
+                        .quarantine
+                        .as_ref()),
+                    state.config.curation.go.quarantine_ttl.as_deref().or(state
+                        .config
+                        .curation
+                        .quarantine_ttl
+                        .as_deref()),
+                );
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "go",
                     data,
@@ -236,9 +197,7 @@ async fn handle(
                         state.config.server.trust_upstream_dates,
                         publish_date,
                     ),
-                )
-                .await
-                {
+                ) {
                     return resp;
                 }
 
@@ -406,30 +365,19 @@ async fn handle(
 
             // Quarantine only the .zip module archive; metadata endpoints pass through.
             if ends_with_ci(&file, ".zip") {
-                let (q_mode, q_secs) = if state.curation().curation_engine.cooldown_exempt_version(
-                    crate::registry_type::RegistryType::Go,
-                    &module_path,
-                    go_curation
-                        .as_ref()
-                        .and_then(|(_, version)| version.as_deref()),
-                ) {
-                    (crate::digest_quarantine::QuarantineMode::Off, 0)
-                } else {
-                    crate::digest_quarantine::resolve_global(
-                        state.config.curation.go.quarantine.as_ref().or(state
-                            .config
-                            .curation
-                            .quarantine
-                            .as_ref()),
-                        state.config.curation.go.quarantine_ttl.as_deref().or(state
-                            .config
-                            .curation
-                            .quarantine_ttl
-                            .as_deref()),
-                    )
-                };
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
-                    &state.storage,
+                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                    state.config.curation.go.quarantine.as_ref().or(state
+                        .config
+                        .curation
+                        .quarantine
+                        .as_ref()),
+                    state.config.curation.go.quarantine_ttl.as_deref().or(state
+                        .config
+                        .curation
+                        .quarantine_ttl
+                        .as_deref()),
+                );
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "go",
                     &bytes,
@@ -440,9 +388,7 @@ async fn handle(
                         state.config.server.trust_upstream_dates,
                         publish_date,
                     ),
-                )
-                .await
-                {
+                ) {
                     return resp;
                 }
             }
@@ -485,50 +431,6 @@ async fn handle(
 // ============================================================================
 // Module path encoding/decoding
 // ============================================================================
-
-/// Prime immutable version metadata before a ZIP's first age/quarantine decision.
-/// Missing metadata keeps the existing unknown-age, fail-closed behavior.
-async fn ensure_go_info_cached(
-    state: &AppState,
-    module_encoded: &str,
-    module_name: &str,
-    version: &str,
-    info_key: &str,
-) {
-    if !state.config.server.trust_upstream_dates
-        || decode_module_path(module_encoded).is_err()
-        || crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Go,
-            module_name,
-        )
-        || state.storage.get(info_key).await.is_ok()
-    {
-        return;
-    }
-    let Some(proxy) = &state.config.go.proxy else {
-        return;
-    };
-    let url = format!(
-        "{}/{}",
-        proxy.trim_end_matches('/'),
-        format_upstream_path(module_encoded, &format!("@v/{version}.info"))
-    );
-    if let Ok(data) = proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.go.proxy_timeout),
-        expose_opt(&state.config.go.proxy_auth).map(UpstreamAuth::Basic),
-        None,
-        &state.circuit_breaker,
-        RegistryType::Go,
-    )
-    .await
-    {
-        // Await persistence: a background cache write would race the age check.
-        let _ = state.storage.put(info_key, data.as_bytes()).await;
-    }
-}
 
 /// Extract publish date from a cached Go .info file.
 ///
@@ -577,6 +479,7 @@ fn decode_module_path(encoded: &str) -> Result<String, ()> {
 }
 
 /// Encode Go module path: `X` → `!x`
+#[cfg(test)]
 fn encode_module_path(path: &str) -> String {
     let mut result = String::with_capacity(path.len() + 8);
     for c in path.chars() {
@@ -1585,85 +1488,6 @@ mod quarantine_first_seen {
         (up, ctx)
     }
 
-    async fn cold_context(info: Option<Vec<u8>>, trust: bool) -> (MockServer, TestContext) {
-        let up = MockServer::start().await;
-        serve(&up, "/example.com/oldmod/@v/v1.0.0.zip", b"ZIP".to_vec()).await;
-        if let Some(info) = info {
-            serve(&up, "/example.com/oldmod/@v/v1.0.0.info", info).await;
-        }
-        let uri = up.uri();
-        let ctx = create_test_context_with_config(move |cfg| {
-            cfg.go.proxy = Some(uri);
-            cfg.server.trust_upstream_dates = trust;
-            quarantine_7d(cfg);
-            cfg.curation.min_release_age = Some("7d".to_string());
-        });
-        (up, ctx)
-    }
-
-    #[tokio::test]
-    async fn cold_zip_primes_info_before_quarantine_and_reuses_it() {
-        let (up, ctx) = cold_context(Some(INFO.to_vec()), true).await;
-        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
-        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
-        let paths = crate::test_helpers::upstream_paths(&up).await;
-        assert_eq!(paths[0], "/example.com/oldmod/@v/v1.0.0.info");
-        assert_eq!(paths[1], "/example.com/oldmod/@v/v1.0.0.zip");
-        assert_eq!(paths.iter().filter(|p| p.ends_with(".info")).count(), 1);
-        assert_eq!(
-            ctx.state
-                .storage
-                .get("go/example.com/oldmod/@v/v1.0.0.info")
-                .await
-                .unwrap(),
-            INFO
-        );
-    }
-
-    #[tokio::test]
-    async fn cold_recent_zip_is_rejected_before_fetching_bytes() {
-        let now = chrono::Utc::now().to_rfc3339();
-        let info = serde_json::json!({"Version": "v1.0.0", "Time": now});
-        let (up, ctx) = cold_context(Some(info.to_string().into_bytes()), true).await;
-        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
-        assert_eq!(
-            crate::test_helpers::upstream_paths(&up).await,
-            vec!["/example.com/oldmod/@v/v1.0.0.info",]
-        );
-    }
-
-    #[tokio::test]
-    async fn cold_missing_or_invalid_info_never_serves_zip() {
-        for info in [None, Some(b"invalid json".to_vec())] {
-            let (_up, ctx) = cold_context(info, true).await;
-            assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
-        }
-    }
-
-    #[tokio::test]
-    async fn cold_internal_module_never_fetches_upstream_metadata() {
-        let up = MockServer::start().await;
-        let uri = up.uri();
-        let ctx = create_test_context_with_config(move |cfg| {
-            cfg.go.proxy = Some(uri);
-            cfg.server.trust_upstream_dates = true;
-            cfg.curation.internal_namespaces = vec!["example.com/*".to_string()];
-            quarantine_7d(cfg);
-        });
-        assert_ne!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
-        assert!(crate::test_helpers::upstream_paths(&up).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cold_untrusted_dates_do_not_prime_info() {
-        let (up, ctx) = cold_context(Some(INFO.to_vec()), false).await;
-        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
-        assert!(!crate::test_helpers::upstream_paths(&up)
-            .await
-            .iter()
-            .any(|p| p.ends_with(".info")));
-    }
-
     #[tokio::test]
     async fn without_trusted_dates_a_cached_info_does_not_date_the_quarantine() {
         let (_up, ctx) = context(false).await;
@@ -1683,131 +1507,5 @@ mod quarantine_first_seen {
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let (_up, ctx) = context(true).await;
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod cooldown_prefix_tests {
-    use crate::test_helpers::{create_test_context_with_config, quarantine_7d, send};
-    use axum::http::{Method, StatusCode};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[tokio::test]
-    async fn cooldown_prefix_exemption_preserves_other_policy() {
-        for (name, blocked) in [
-            ("github.com/wistia/pkg", false),
-            ("github.com/wistia-other/pkg", false),
-            ("github.com/wistia/pkg", true),
-        ] {
-            let up = MockServer::start().await;
-            let artifact = format!("/{name}/@v/v1.0.0.zip");
-            Mock::given(method("GET"))
-                .and(path(artifact.clone()))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ARTIFACT".to_vec()))
-                .mount(&up)
-                .await;
-            let date = chrono::Utc::now().to_rfc3339();
-            Mock::given(method("GET"))
-                .and(path(format!("/{name}/@v/v1.0.0.info")))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"Version":"v1.0.0", "Time":date})),
-                )
-                .mount(&up)
-                .await;
-            let (_dir, blocklist) = crate::test_helpers::blocklist_file("go", name);
-            let uri = up.uri();
-            let ctx = create_test_context_with_config(move |cfg| {
-                cfg.go.proxy = Some(uri);
-                cfg.server.trust_upstream_dates = true;
-                quarantine_7d(cfg);
-                cfg.curation.min_release_age = Some("7d".into());
-                cfg.curation.go.cooldown_exempt_prefixes = vec!["github.com/wistia/".into()];
-                if blocked {
-                    cfg.curation.blocklist_path = Some(blocklist);
-                }
-            });
-            let expected = if name == "github.com/wistia/pkg" && !blocked {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            };
-            let uri = format!("/go{artifact}");
-            for _ in 0..2 {
-                assert_eq!(
-                    send(&ctx.app, Method::GET, &uri, "").await.status(),
-                    expected
-                );
-            }
-        }
-    }
-    #[tokio::test]
-    async fn exact_version_exemption_preserves_other_policy() {
-        for (name, version, blocked) in [
-            ("github.com/wistia/pkg", "v1.0.0", false),
-            ("github.com/wistia/pkg", "v1.0.0-!r!c1", false),
-            ("github.com/wistia/pkg", "v1.0.1", false),
-            ("github.com/wistia-other/pkg", "v1.0.0", false),
-            ("github.com/wistia/pkg", "v1.0.0", true),
-        ] {
-            let up = MockServer::start().await;
-            let artifact = format!("/{name}/@v/{version}.zip");
-            Mock::given(method("GET"))
-                .and(path(artifact.clone()))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ARTIFACT".to_vec()))
-                .mount(&up)
-                .await;
-            let date = chrono::Utc::now().to_rfc3339();
-            Mock::given(method("GET"))
-                .and(path(format!("/{name}/@v/{version}.info")))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"Version":version, "Time":date})),
-                )
-                .mount(&up)
-                .await;
-            let (_dir, blocklist) = crate::test_helpers::blocklist_file("go", name);
-            let uri = up.uri();
-            let ctx = create_test_context_with_config(move |cfg| {
-                cfg.go.proxy = Some(uri);
-                cfg.server.trust_upstream_dates = true;
-                quarantine_7d(cfg);
-                cfg.curation.min_release_age = Some("7d".into());
-                cfg.curation.go.cooldown_exempt_versions = vec![serde_json::from_value(
-                    serde_json::json!({"name":"github.com/wistia/pkg","version":if version.contains("!r!c") { "v1.0.0-RC1" } else { "v1.0.0" }}),
-                )
-                .unwrap()];
-                if blocked {
-                    cfg.curation.blocklist_path = Some(blocklist);
-                }
-            });
-            let expected = if name == "github.com/wistia/pkg"
-                && (version == "v1.0.0" || version == "v1.0.0-!r!c1")
-                && !blocked
-            {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            };
-            let uri = format!("/go{artifact}");
-            let holders = ctx.state.storage.holders();
-            for _ in 0..2 {
-                assert_eq!(
-                    send(&ctx.app, Method::GET, &uri, "").await.status(),
-                    expected
-                );
-                crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
-                if expected == StatusCode::OK {
-                    assert!(ctx
-                        .state
-                        .storage
-                        .stat(&format!("go/{name}/@v/{version}.zip"))
-                        .await
-                        .is_some());
-                }
-            }
-        }
     }
 }

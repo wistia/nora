@@ -24,7 +24,7 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "1.4.3",
+        version = "1.4.2",
         description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, RPM, Debian, and CPAN",
         license(name = "MIT"),
         contact(name = "The NORA Authors", url = "https://getnora.dev")
@@ -675,7 +675,7 @@ pub async fn cargo_publish() {}
 /// PyPI Simple index
 #[utoipa::path(
     get,
-    path = "/pypi/simple/",
+    path = "/simple/",
     tag = "pypi",
     responses(
         (status = 200, description = "HTML list of packages"),
@@ -687,7 +687,7 @@ pub async fn pypi_simple() {}
 /// PyPI package page
 #[utoipa::path(
     get,
-    path = "/pypi/simple/{name}/",
+    path = "/simple/{name}/",
     tag = "pypi",
     params(
         ("name" = String, Path, description = "Package name")
@@ -705,7 +705,7 @@ pub async fn pypi_package() {}
 /// Accepts a multipart form upload (twine-compatible).
 #[utoipa::path(
     post,
-    path = "/pypi/simple/",
+    path = "/simple/",
     tag = "pypi",
     responses(
         (status = 200, description = "Package uploaded"),

@@ -56,7 +56,7 @@ npm install lodash
 ### Use as PyPI Index
 
 ```bash
-pip install --index-url http://localhost:4000/pypi/simple/ requests
+pip install --index-url http://localhost:4000/simple/ requests
 ```
 
 ### Production Deployment with HTTPS
@@ -85,10 +85,10 @@ upstream is unreachable, a cached packument is served without the versions it na
 address (or not at all with `serve_stale` off). Bring the upstream back, or serve on the old
 address again until the packuments have been fetched anew.
 
-**PyPI index URL** — use `/pypi/simple/`:
+**PyPI index URL** — use `/simple/`, not `/pypi/simple/`:
 
 ```bash
-pip install --index-url https://registry.example.com/pypi/simple/ requests
+pip install --index-url https://registry.example.com/simple/ requests
 ```
 
 **Self-signed TLS** — pip silently fails with "No matching distribution found"
@@ -96,7 +96,7 @@ unless you specify `--trusted-host` or `--cert`:
 
 ```bash
 pip install \
-  --index-url https://registry.example.com/pypi/simple/ \
+  --index-url https://registry.example.com/simple/ \
   --trusted-host registry.example.com \
   requests
 ```
@@ -105,7 +105,7 @@ To make these settings permanent, create `~/.pip/pip.conf`:
 
 ```ini
 [global]
-index-url = https://registry.example.com/pypi/simple/
+index-url = https://registry.example.com/simple/
 trusted-host = registry.example.com
 ```
 
@@ -181,7 +181,7 @@ npm install lodash
 ### Использование как PyPI индекс
 
 ```bash
-pip install --index-url http://localhost:4000/pypi/simple/ requests
+pip install --index-url http://localhost:4000/simple/ requests
 ```
 
 ### Продакшен с HTTPS
@@ -210,10 +210,10 @@ environment:
 (а с выключенным `serve_stale` не отдаётся вовсе). Верните апстрим или на время, пока packument
 не будут перезапрошены, верните прежний адрес.
 
-**URL для PyPI** — используйте `/pypi/simple/`:
+**URL для PyPI** — используйте `/simple/`, а не `/pypi/simple/`:
 
 ```bash
-pip install --index-url https://registry.example.com/pypi/simple/ requests
+pip install --index-url https://registry.example.com/simple/ requests
 ```
 
 **Самоподписанный TLS** — pip молча падает с ошибкой "No matching distribution found",
@@ -221,7 +221,7 @@ pip install --index-url https://registry.example.com/pypi/simple/ requests
 
 ```bash
 pip install \
-  --index-url https://registry.example.com/pypi/simple/ \
+  --index-url https://registry.example.com/simple/ \
   --trusted-host registry.example.com \
   requests
 ```
@@ -230,7 +230,7 @@ pip install \
 
 ```ini
 [global]
-index-url = https://registry.example.com/pypi/simple/
+index-url = https://registry.example.com/simple/
 trusted-host = registry.example.com
 ```
 

@@ -20,14 +20,14 @@ test.describe('Maven Proxy', () => {
 
 test.describe('PyPI Proxy', () => {
   test('simple index returns HTML', async ({ request }) => {
-    const response = await request.get('/pypi/simple/');
+    const response = await request.get('/simple/');
     expect(response.ok()).toBeTruthy();
     const text = await response.text();
     expect(text).toContain('Simple Index');
   });
 
   test('package page returns links', async ({ request }) => {
-    const response = await request.get('/pypi/simple/requests/');
+    const response = await request.get('/simple/requests/');
     expect(response.ok()).toBeTruthy();
     const text = await response.text();
     expect(text).toContain('requests');

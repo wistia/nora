@@ -882,7 +882,7 @@ echo -n "$PYPI_HASH" > "$STORAGE_DIR/pypi/${PYPI_PKG}/${PYPI_FILE}.sha256"
 PYPI_HEADERS=$(mktemp)
 PYPI_RESP=$(curl -sf -D "$PYPI_HEADERS" \
     -H "Accept: application/vnd.pypi.simple.v1+json" \
-    "$BASE/pypi/simple/${PYPI_PKG}/" 2>/dev/null || echo "")
+    "$BASE/simple/${PYPI_PKG}/" 2>/dev/null || echo "")
 
 if [ -n "$PYPI_RESP" ]; then
     # 10.1 Content-Type is PEP 691
