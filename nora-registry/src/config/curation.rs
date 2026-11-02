@@ -211,10 +211,14 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
         RegistryType::Gems => {
             name.len() <= 256 && component(name) && !name.contains('~') && !name.contains("..")
         }
+        RegistryType::Maven => name.split_once(':').is_some_and(|(group, artifact)| {
+            group.split('.').all(component) && component(artifact)
+        }),
         _ => false,
     };
     valid_name
         && match registry {
+            RegistryType::Maven => component(version),
             RegistryType::Npm => crate::curation::npm_version_key(version).is_some(),
             RegistryType::Go => crate::curation::go_version_key(version).is_some(),
             RegistryType::Hex => crate::curation::pub_version_key(version).is_some(),
@@ -446,7 +450,7 @@ impl CurationConfig {
             if let Some(section) = self.registry_override(registry) {
                 for entry in &section.cooldown_exempt_versions {
                     if !valid_exempt_identity(registry, &entry.name, &entry.version) {
-                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex or gems"));
+                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex, gems or maven"));
                     }
                 }
 
