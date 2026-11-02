@@ -85,7 +85,7 @@ Maven metadata XML and all checksum sidecars use `Cache-Control: no-store`, as d
 
 With `trust_upstream_dates=true`, immutable files fetched directly from the HTTPS release repositories `repo.maven.apache.org/maven2` or `repo1.maven.org/maven2` can use the successful GET response's `Last-Modified` as trusted upstream date evidence. This is an explicit trust in the origin's reported modification time, not cryptographic proof of publication time. Redirected, authenticated, private, snapshot, and look-alike origins do not provide this evidence. Search websites are not artifact repository aliases.
 
-Nora stores successful evidence under `.nora-maven-dates/`, bound to the exact artifact path, source URL and byte digest. A warm artifact reads shared evidence instead of querying search. For a cold canonical Central response without a usable header, Nora uses the documented exact-GAV search API with a two-second cap and verifies every returned coordinate. Lookup timeouts, upstream errors, and malformed responses (including valid JSON with an invalid search envelope or upstream error status) return `503 Service Unavailable` with `Retry-After: 30` and `Cache-Control: no-store` when cooldown enforcement requires a date; the shared thirty-second backoff preserves this retryable result without seeding a quarantine hold or publishing bytes. A successful lookup with no usable date continues through the unknown-date quarantine policy. Missing shared date records also retain that policy; storage errors, corrupt records, and failed evidence readback return retryable 503 when dates are required. A blocklist-only policy does not require a date lookup to succeed. A valid curation bypass token removes the release-age requirement but does not bypass enforced digest quarantine. Range requests retain partial storage reads when no digest-bound date or integrity checks are needed, including valid curation bypass requests when digest quarantine is off. POM and Gradle `.module` downloads capture their own response dates just like JARs, without an extra timestamp request; these dates are not reused for other files in the version. Newly held bytes are not published to the artifact cache before a successful quarantine decision, so later cold retries can recover evidence. Starting from a clean enforced store is the supported rollout; enabling enforcement over pre-existing unknown-date cached bytes requires separate migration handling.
+Nora stores successful evidence under `.nora-maven-dates/`, bound to the exact artifact path, source URL and byte digest. A warm artifact reads shared evidence instead of querying search. For a cold canonical Central response without a usable header, Nora uses the documented exact-GAV search API with a two-second cap and verifies every returned coordinate. Lookup timeouts, upstream errors, and malformed responses (including valid JSON with an invalid search envelope or upstream error status) return `503 Service Unavailable` with `Retry-After: 30` and `Cache-Control: no-store` when cooldown enforcement requires a date; the shared thirty-second backoff preserves this retryable result without seeding a quarantine hold or publishing bytes. A successful lookup with no usable date continues through the unknown-date quarantine policy. Missing shared date records also retain that policy; storage errors, corrupt records, and failed evidence readback return retryable 503 when dates are required. A blocklist-only policy does not require a date lookup to succeed. A valid curation bypass token removes the release-age requirement but does not bypass enforced digest quarantine. Range requests retain partial storage reads when no digest-bound date or integrity checks are needed, including valid curation bypass requests when digest quarantine is off. POM and Gradle `.module` downloads capture their own response dates just like JARs, without an extra timestamp request; these dates are not reused for other files in the version. Newly held bytes are not published to the artifact cache before a successful quarantine decision, so later cold retries can recover evidence. Cached unknown-date releases can recover through the bounded upstream revalidation described below.
 
 ## Recovering a shared Maven unknown-date hold
 
@@ -93,9 +93,8 @@ The explicit recoverable Maven quarantine API preserves the original shared
 `first_seen` observation and tags newly created records with timestamp provenance.
 Validated Central release evidence is stored independently under
 `.nora-quarantine-release/maven/`, using conditional creation and read-back so
-replicas agree without rewriting the observation. Only canonical HTTPS Central
-artifact URLs, valid nonfuture dates and evidence bound to the served SHA-256
-content digest qualify. Evidence establishes the age of those bytes, not the
+replicas agree without rewriting the observation. Only artifact URLs beneath a currently configured Maven upstream, valid nonfuture
+dates and evidence bound to the served SHA-256 content digest qualify. Evidence establishes the age of those bytes, not the
 release date of every GAV containing them: the handler must separately evaluate
 its exact artifact's release-age rule using current validated evidence.
 
@@ -105,3 +104,27 @@ trust immediately stops using recovery evidence, and unreadable or corrupt state
 fails closed. Untagged records retain their existing hold. This API's recovery is
 for shared object storage; the local JSONL ledger remains conservative and starts
 from the local observation without accepting release-date recovery.
+
+## Dates from explicitly configured Maven upstreams
+
+With `server.trust_upstream_dates = true`, every entry in `maven.proxies` is
+trusted to supply a valid `Last-Modified` header for the artifact bytes it serves.
+This includes authenticated proxies and repositories such as Confluent, not only
+Maven Central. Configure only upstreams whose dates you trust. Explicit HTTP
+upstreams are supported, but HTTPS provides transport integrity.
+
+Trust is scoped to each configured URL's scheme, host, port and repository path.
+Redirects are not followed when trusting response dates; URL credentials, query
+strings and fragments are not accepted as date sources. Credentials supplied in
+a proxy's `auth` field still authenticate the fetch and are not saved in evidence.
+Only Central responses may use the public Central search fallback; missing or
+invalid headers on other upstreams retain the unknown-date quarantine. Recent
+valid dates still enforce the minimum release age. Disabling upstream-date trust
+keeps the existing conservative behavior.
+
+Shared date evidence is checked against the current configured upstream list on
+every use. Removing its source makes that evidence unusable. Existing immutable
+cached bytes lacking evidence can be re-fetched from configured non-Central
+upstreams to repair a hold, with a shared thirty-second retry interval. A repair
+must return the same bytes; it cannot replace a cached release. Original shared
+quarantine observations and legacy untagged holds are preserved.
