@@ -1756,19 +1756,30 @@ mod trusted_release_recovery_tests {
         for date in [-1, 0, Utc::now().timestamp() + 3600] {
             assert!(TrustedReleaseEvidence::maven_central(date, URL, BYTES).is_none());
         }
+        assert!(TrustedReleaseEvidence::maven_central(
+            1,
+            &URL.replace("repo.maven.apache.org", "repo1.maven.org"),
+            BYTES
+        )
+        .is_some());
         for url in [
-            "http://repo.maven.apache.org/maven2/a.jar",
-            "https://repo.maven.apache.org.evil.example/maven2/a.jar",
-            "https://repo.maven.apache.org:8443/maven2/a.jar",
-            "https://user:pass@repo.maven.apache.org/maven2/a.jar",
-            "https://repo.maven.apache.org/maven2/a.jar?x=1",
-            "https://repo.maven.apache.org/maven2/a.jar#x",
-            "https://repo.maven.apache.org/other/a.jar",
-            "https://repo.maven.apache.org/maven2/",
-            "https://repo.maven.apache.org/maven2/a%2fb.jar",
+            URL.replace("https:", "http:"),
+            URL.replace(
+                "repo.maven.apache.org",
+                "repo.maven.apache.org.evil.example",
+            ),
+            URL.replace("repo.maven.apache.org", "repo.maven.apache.org:8443"),
+            URL.replace("https://", "https://user:pass@"),
+            format!("{URL}?x=1"),
+            format!("{URL}#x"),
+            URL.replace("/maven2/", "/other/"),
+            "https://repo.maven.apache.org/maven2/".to_owned(),
+            URL.replace("demo-1.0.jar", "demo%2fother.jar"),
+            URL.replace("/1.0/", "/1.0-SNAPSHOT/"),
+            URL.replace("demo-1.0.jar", "maven-metadata.xml"),
         ] {
             assert!(
-                TrustedReleaseEvidence::maven_central(1, url, BYTES).is_none(),
+                TrustedReleaseEvidence::maven_central(1, &url, BYTES).is_none(),
                 "{url}"
             );
         }
