@@ -71,10 +71,12 @@ CloudFront must cache HTML and JSON separately by `Accept`, and must forward req
 
 PyPI digest quarantine uses shared object-store records under `.nora-quarantine/pypi/` when using S3. Replicas agree on the first successful record and fail closed if shared state cannot be read or written. On migration, existing cached artifacts without a shared record are evaluated using their trusted upstream upload time when available; artifacts without a trusted date begin a new quarantine hold. Local storage continues to use the local ledger.
 
+PyPI exact-version cooldown exemptions use `[[curation.pypi.cooldown_exempt_versions]]` entries. Project names use PEP 503 normalization and versions use PEP 440 equivalence. These entries skip release-age and digest-quarantine checks only; blocklists, integrity and namespace checks still apply. Exemptions do not grant access to private upstream artifacts.
+
 ## Maven shared quarantine migration
 
 Maven artifacts use shared object-store quarantine records so replicas agree on first seen. Existing cached artifacts without a shared record may receive a new seven-day hold if no trusted Maven Central release date is available. Deploying this change does not invalidate existing CloudFront artifacts: invalidate affected Maven paths separately when policy enforcement must take effect immediately. Cached Maven requests now consult Maven Central for a trusted release date when applicable; this adds upstream latency and may fall back to first-seen quarantine if the date lookup fails.
 
 Maven exact-version cooldown exemptions use `[[curation.maven.cooldown_exempt_versions]]` entries with a case-sensitive `group.id:artifact-id` name and exact version. These entries skip release-age and digest-quarantine checks only; blocklists, integrity and namespace checks still apply. Exemptions do not grant access to private upstream artifacts.
 
-PyPI exact-version cooldown exemptions use `[[curation.pypi.cooldown_exempt_versions]]` entries. Project names use PEP 503 normalization and versions use PEP 440 equivalence. These entries skip release-age and digest-quarantine checks only; blocklists, integrity and namespace checks still apply. Exemptions do not grant access to private upstream artifacts.
+Maven metadata XML and all checksum sidecars use `Cache-Control: no-store`, as do snapshot paths. Stable XML and checksum URLs can be fetched and revalidated independently; equal TTLs do not ensure generation consistency. Long stale windows are deferred until a generation-consistent strategy is available. Existing cached metadata and sidecars require CloudFront invalidation when this policy deploys. Release artifact caching is unchanged.
