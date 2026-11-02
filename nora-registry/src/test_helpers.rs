@@ -127,6 +127,21 @@ pub fn create_test_context_with_egress_proxy(
     build_context_full(false, &[], false, customize, None, Some(egress_proxy))
 }
 
+pub fn create_test_context_with_storage_config_and_egress(
+    storage: Storage,
+    egress_proxy: &str,
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context_full(
+        false,
+        &[],
+        false,
+        customize,
+        Some(storage),
+        Some(egress_proxy),
+    )
+}
+
 fn build_context_with(
     auth_enabled: bool,
     users: &[(&str, &str)],

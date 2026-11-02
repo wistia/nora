@@ -626,7 +626,7 @@ async fn download(
             // per version). maven-metadata.xml is mutable (curation_coords=None) —
             // never quarantine it or its digest would change forever.
             if curation_coords.is_some() && !cooldown_exempt {
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared_recoverable(
                     &state.storage,
                     &state.digest_store,
                     "maven",
@@ -634,10 +634,17 @@ async fn download(
                     &q_mode,
                     q_secs,
                     "cache",
-                    crate::digest_quarantine::first_seen_seed(
-                        state.config.server.trust_upstream_dates,
-                        publish_date,
-                    ),
+                    state.config.server.trust_upstream_dates,
+                    trusted_date
+                        .as_ref()
+                        .and_then(|record| {
+                            crate::digest_quarantine::TrustedReleaseEvidence::maven_central(
+                                record.timestamp,
+                                &record.source,
+                                data,
+                            )
+                        })
+                        .as_ref(),
                 )
                 .await
                 {
@@ -854,7 +861,7 @@ async fn download(
                             .as_deref()
                             .or(state.config.curation.quarantine_ttl.as_deref()),
                     );
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_shared_recoverable(
                         &state.storage,
                         &state.digest_store,
                         "maven",
@@ -862,10 +869,17 @@ async fn download(
                         &q_mode,
                         q_secs,
                         &url,
-                        crate::digest_quarantine::first_seen_seed(
-                            state.config.server.trust_upstream_dates,
-                            publish_date,
-                        ),
+                        state.config.server.trust_upstream_dates,
+                        trusted_date
+                            .as_ref()
+                            .and_then(|record| {
+                                crate::digest_quarantine::TrustedReleaseEvidence::maven_central(
+                                    record.timestamp,
+                                    &record.source,
+                                    &data,
+                                )
+                            })
+                            .as_ref(),
                     )
                     .await
                     {
@@ -920,7 +934,7 @@ async fn download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared_recoverable(
                 &state.storage,
                 &state.digest_store,
                 "maven",
@@ -928,10 +942,17 @@ async fn download(
                 &q_mode,
                 q_secs,
                 "cache-stale",
-                crate::digest_quarantine::first_seen_seed(
-                    state.config.server.trust_upstream_dates,
-                    publish_date,
-                ),
+                state.config.server.trust_upstream_dates,
+                trusted_date
+                    .as_ref()
+                    .and_then(|record| {
+                        crate::digest_quarantine::TrustedReleaseEvidence::maven_central(
+                            record.timestamp,
+                            &record.source,
+                            data,
+                        )
+                    })
+                    .as_ref(),
             )
             .await
             {
@@ -3547,19 +3568,26 @@ mod central_date_evidence_tests {
 
     #[tokio::test]
     async fn warm_download_uses_cached_evidence_without_egress() {
-        use crate::test_helpers::{create_test_context_with_egress_proxy, send, EgressRecorder};
+        use crate::test_helpers::{
+            create_test_context_with_storage_config_and_egress, send, EgressRecorder,
+        };
         use axum::http::Method;
         let egress = EgressRecorder::start().await;
-        let ctx = create_test_context_with_egress_proxy(&egress.url, |cfg| {
-            cfg.maven.proxies =
-                serde_json::from_value(serde_json::json!(["https://repo.maven.apache.org/maven2"]))
-                    .unwrap();
-            cfg.server.trust_upstream_dates = true;
-            cfg.curation.mode = crate::config::CurationMode::Enforce;
-            cfg.curation.min_release_age = Some("7d".into());
-            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
-            cfg.curation.quarantine_ttl = Some("7d".into());
-        });
+        let ctx = create_test_context_with_storage_config_and_egress(
+            crate::Storage::in_memory(),
+            &egress.url,
+            |cfg| {
+                cfg.maven.proxies = serde_json::from_value(serde_json::json!([
+                    "https://repo.maven.apache.org/maven2"
+                ]))
+                .unwrap();
+                cfg.server.trust_upstream_dates = true;
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.min_release_age = Some("7d".into());
+                cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("7d".into());
+            },
+        );
         let path = "org/example/demo/1.0/demo-1.0.jar";
         let bytes = b"artifact";
         let source =
@@ -3588,6 +3616,97 @@ mod central_date_evidence_tests {
         let response = send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(egress.seen().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_date_lookup_can_recover_without_publishing_held_bytes() {
+        use crate::digest_quarantine::{
+            proxy_gate_shared_recoverable, QuarantineMode, TrustedReleaseEvidence,
+        };
+        let storage = crate::Storage::in_memory();
+        let ctx = create_test_context_with_storage_and_config(storage.clone(), |_| {});
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        let bytes = b"artifact";
+        let source =
+            reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}")).unwrap();
+        // Simulate an earlier failed bounded search: retry backoff must not make
+        // unknown evidence permanent, and must not suppress a later HTTP date.
+        storage
+            .put(
+                &format!("{}.retry", date_key(path, bytes)),
+                &serde_json::to_vec(&chrono::Utc::now().timestamp()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(record_central_date(
+            &ctx.state,
+            path,
+            bytes,
+            &source,
+            &reqwest::header::HeaderMap::new(),
+            "org.example:demo",
+            "1.0"
+        )
+        .await
+        .is_none());
+        assert!(proxy_gate_shared_recoverable(
+            &storage,
+            &ctx.state.digest_store,
+            "maven",
+            bytes,
+            &QuarantineMode::Enforce,
+            604800,
+            source.as_str(),
+            true,
+            None
+        )
+        .await
+        .is_some());
+        assert!(storage.get(&storage_key(path)).await.is_err());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        let record = record_central_date(
+            &ctx.state,
+            path,
+            bytes,
+            &source,
+            &headers,
+            "org.example:demo",
+            "1.0",
+        )
+        .await
+        .unwrap();
+        let evidence =
+            TrustedReleaseEvidence::maven_central(record.timestamp, &record.source, bytes).unwrap();
+        assert!(proxy_gate_shared_recoverable(
+            &storage,
+            &ctx.state.digest_store,
+            "maven",
+            bytes,
+            &QuarantineMode::Enforce,
+            604800,
+            source.as_str(),
+            true,
+            Some(&evidence)
+        )
+        .await
+        .is_none());
+        assert!(proxy_gate_shared_recoverable(
+            &storage,
+            &ctx.state.digest_store,
+            "maven",
+            bytes,
+            &QuarantineMode::Enforce,
+            604800,
+            source.as_str(),
+            false,
+            Some(&evidence)
+        )
+        .await
+        .is_some());
     }
 
     #[test]
