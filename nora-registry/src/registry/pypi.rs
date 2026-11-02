@@ -36,6 +36,8 @@ use std::time::Duration;
 
 /// PEP 691 JSON content type
 const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
+const INDEX_CACHE_CONTROL: &str =
+    "public, max-age=300, stale-while-revalidate=86400, stale-if-error=432000";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -75,7 +77,7 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
     let mut pkg_list: Vec<_> = packages.into_iter().collect();
     pkg_list.sort();
 
-    if wants_json(&headers) {
+    let response = if wants_json(&headers) {
         // PEP 691 JSON response
         let projects: Vec<serde_json::Value> = pkg_list
             .iter()
@@ -89,7 +91,8 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, PEP691_JSON),
-                (header::CACHE_CONTROL, "public, max-age=60, must-revalidate"),
+                (header::CACHE_CONTROL, INDEX_CACHE_CONTROL),
+                (header::VARY, "Accept"),
             ],
             serde_json::to_string(&body).unwrap_or_default(),
         )
@@ -110,11 +113,15 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
         html.push_str("</body></html>");
         (
             StatusCode::OK,
-            [(header::CACHE_CONTROL, "public, max-age=60, must-revalidate")],
+            [
+                (header::CACHE_CONTROL, INDEX_CACHE_CONTROL),
+                (header::VARY, "Accept"),
+            ],
             Html(html),
         )
             .into_response()
-    }
+    };
+    project_index_cache(response, &state, &headers)
 }
 
 // ============================================================================
@@ -266,6 +273,7 @@ async fn package_versions(
     // win over all upstreams). One upstream's failure or open breaker must not
     // sink the others — skip it and serve the merge of what answered.
     let mut circuit_open = false;
+    let mut upstream_incomplete = false;
     let mut miss = UpstreamMiss::default();
     if !is_internal && !hosted && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
@@ -288,9 +296,11 @@ async fn package_versions(
                 }
                 Err(crate::registry::ProxyError::CircuitOpen(_)) => {
                     circuit_open = true;
+                    upstream_incomplete = true;
                     continue;
                 }
                 Err(e) => {
+                    upstream_incomplete = true;
                     tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
                     miss.record(&e);
                     continue;
@@ -299,23 +309,38 @@ async fn package_versions(
         }
         let merged = merge_file_lists(upstream_files, &local_files);
         if !merged.is_empty() {
-            return if wants_json(&headers) {
+            let mut response = if wants_json(&headers) {
                 let pep700 = pep700_meta(&merged, &local_sizes, &dates);
                 versions_json_response(&normalized, &merged, &base_url, &pep700)
             } else {
                 versions_html_response(&normalized, &merged, &base_url)
             };
+            if upstream_incomplete {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-store"),
+                );
+            }
+            return project_index_cache(response, &state, &headers);
         }
     }
 
     // Local files only — degrade gracefully when upstreams list nothing or are down.
     if !local_files.is_empty() {
-        return if wants_json(&headers) {
+        let mut response = if wants_json(&headers) {
             let pep700 = pep700_meta(&local_files, &local_sizes, &dates);
             versions_json_response(&normalized, &local_files, &base_url, &pep700)
         } else {
             versions_html_response(&normalized, &local_files, &base_url)
         };
+        // Do not cache an incomplete fallback when an upstream listing failed.
+        if !is_internal && !hosted && !upstreams.is_empty() {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+        }
+        return project_index_cache(response, &state, &headers);
     }
 
     // A hosted project with no file left lists nothing; the upstream was not asked.
@@ -959,7 +984,11 @@ fn versions_json_response(
 
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, PEP691_JSON)],
+        [
+            (header::CONTENT_TYPE, PEP691_JSON),
+            (header::CACHE_CONTROL, INDEX_CACHE_CONTROL),
+            (header::VARY, "Accept"),
+        ],
         serde_json::to_string(&body).unwrap_or_default(),
     )
         .into_response()
@@ -1026,6 +1055,20 @@ fn pep700_meta(
     out
 }
 
+// Authenticated or private indexes must never be stored in a shared cache.
+fn project_index_cache(mut response: Response, state: &AppState, headers: &HeaderMap) -> Response {
+    if (state.config.auth.enabled && !state.config.auth.anonymous_read)
+        || headers.contains_key(header::AUTHORIZATION)
+        || headers.contains_key("x-nora-bypass-token")
+    {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
+}
+
 fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
     let base = base_url.trim_end_matches('/');
     let escaped = html_escape(normalized);
@@ -1052,7 +1095,15 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
     }
     html.push_str("</body></html>");
 
-    (StatusCode::OK, Html(html)).into_response()
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, INDEX_CACHE_CONTROL),
+            (header::VARY, "Accept"),
+        ],
+        Html(html),
+    )
+        .into_response()
 }
 
 // ============================================================================
@@ -2265,6 +2316,32 @@ mod integration_tests {
         ] {
             let response = send(&ctx.app, Method::GET, path, "").await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn project_index_cache_headers_vary_by_accept() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"data")
+            .await
+            .unwrap();
+        for accept in ["text/html", "application/vnd.pypi.simple.v1+json"] {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/pypi/simple/flask/",
+                vec![("accept", accept)],
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[axum::http::header::CACHE_CONTROL],
+                super::INDEX_CACHE_CONTROL
+            );
+            assert_eq!(response.headers()[axum::http::header::VARY], "Accept");
         }
     }
 

@@ -424,16 +424,45 @@ pub fn check_download(
                 );
                 None
             } else {
-                Some(
-                    BlockedResponse {
-                        rule: rule.clone(),
-                        reason: reason.clone(),
-                        registry,
-                        package: name.to_string(),
-                        version: version.known().map(|v| v.to_string()),
+                let mut response = BlockedResponse {
+                    rule: rule.clone(),
+                    reason: reason.clone(),
+                    registry,
+                    package: name.to_string(),
+                    version: version.known().map(|v| v.to_string()),
+                }
+                .into_response();
+                // Shared caching is safe only when bypass cannot change the answer.
+                if registry == RegistryType::PyPI
+                    && rule == "min-release-age"
+                    && bypass_token.is_none()
+                {
+                    let threshold = engine
+                        .config
+                        .pypi
+                        .min_release_age
+                        .as_deref()
+                        .or(engine.config.min_release_age.as_deref())
+                        .and_then(|s| parse_duration(s).ok());
+                    if let (Some(published), Some(threshold)) = (publish_date, threshold) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let remaining = published
+                            .saturating_add(threshold)
+                            .saturating_sub(now)
+                            .clamp(0, 300);
+                        if let Ok(value) =
+                            format!("public, max-age=0, s-maxage={remaining}").parse()
+                        {
+                            response
+                                .headers_mut()
+                                .insert(axum::http::header::CACHE_CONTROL, value);
+                        }
                     }
-                    .into_response(),
-                )
+                }
+                Some(response)
             }
         }
         Decision::Allow | Decision::Skip => None,
@@ -3955,6 +3984,74 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn pypi_age_denial_cache_ttl_respects_boundary_and_override() {
+        let mut config = CurationConfig {
+            mode: CurationMode::Enforce,
+            min_release_age: Some("7d".into()),
+            ..CurationConfig::default()
+        };
+        config.pypi.min_release_age = Some("1h".into());
+        let (filter, errors) = super::MinReleaseAgeFilter::from_config(&config);
+        assert!(errors.is_empty());
+        let mut engine = CurationEngine::new(config);
+        engine.add_filter(Box::new(filter.unwrap()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let request = |published, token: Option<&str>| {
+            super::check_download(
+                &engine,
+                token,
+                &axum::http::HeaderMap::new(),
+                RegistryType::PyPI,
+                "demo",
+                RequestVersion::Known("1.0".into()),
+                Some(published),
+            )
+            .unwrap()
+        };
+        let far = request(now, None);
+        assert_eq!(
+            far.headers()[axum::http::header::CACHE_CONTROL],
+            "public, max-age=0, s-maxage=300"
+        );
+        let near = request(now - 3570, None);
+        let h = near.headers()[axum::http::header::CACHE_CONTROL]
+            .to_str()
+            .unwrap();
+        let seconds: i64 = h.rsplit('=').next().unwrap().parse().unwrap();
+        assert!((0..=30).contains(&seconds), "{h}");
+        assert!(request(now, Some("secret"))
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .is_none());
+    }
+
+    #[test]
+    fn pypi_non_age_denial_has_no_shared_cache_ttl() {
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
+        engine.add_filter(Box::new(BlockAllFilter));
+        let response = super::check_download(
+            &engine,
+            None,
+            &axum::http::HeaderMap::new(),
+            RegistryType::PyPI,
+            "demo",
+            RequestVersion::Known("1.0".into()),
+            Some(1),
+        )
+        .unwrap();
+        assert!(response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .is_none());
     }
 
     #[test]
