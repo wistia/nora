@@ -1286,7 +1286,7 @@ pub fn render_package_detail(
         Some(RegistryType::Npm) => format!("npm install {} --registry {}/npm", name, base_url),
         Some(RegistryType::Cargo) => format!("cargo add {}", name),
         Some(RegistryType::PyPI) => {
-            format!("pip install {} --index-url {}/simple", name, base_url)
+            format!("pip install {} --index-url {}/pypi/simple", name, base_url)
         }
         Some(RegistryType::Go) => format!("GOPROXY={}/go go get {}", base_url, name),
         Some(RegistryType::Raw) => {
@@ -1302,6 +1302,15 @@ pub fn render_package_detail(
             name, base_url
         ),
         Some(RegistryType::Gems) => format!("gem install {} --source {}/gems", name, base_url),
+        Some(RegistryType::Hex) => {
+            let requirement = detail.versions.first()
+                .map(|v| format!("~> {}", v.version))
+                .unwrap_or_else(|| ">= 0.0.0".to_owned());
+            format!(
+                "# Add to the deps list in mix.exs:\n{{:{}, \"{}\"}}\n\nHEX_MIRROR=\"{}/hex\" mix deps.get",
+                name, requirement, base_url.trim_end_matches('/')
+            )
+        },
         Some(RegistryType::Terraform) => format!(
             "# In required_providers block:\n  source = \"{}/terraform/{}\"",
             base_url
@@ -1451,7 +1460,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">{install_label}</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
-                <code id="install-cmd" class="flex-1 whitespace-nowrap">{cmd}</code>
+                <code id="install-cmd" class="flex-1" style="white-space: pre;">{cmd}</code>
                 <button id="copy-btn" data-cmd="{cmd}" onclick="navigator.clipboard.writeText(this.getAttribute('data-cmd'))" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
@@ -1886,6 +1895,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         Some(RegistryType::Terraform) => icons::TERRAFORM,
         Some(RegistryType::Ansible) => icons::ANSIBLE,
         Some(RegistryType::Nuget) => icons::NUGET,
+        Some(RegistryType::Hex) => icons::RAW,
         Some(RegistryType::PubDart) => icons::PUB,
         Some(RegistryType::Conan) => icons::CONAN,
         Some(RegistryType::Rpm) => icons::RPM,
@@ -1911,6 +1921,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         Some(RegistryType::Terraform) => "Terraform Registry",
         Some(RegistryType::Ansible) => "Ansible Galaxy",
         Some(RegistryType::Nuget) => "NuGet Gallery",
+        Some(RegistryType::Hex) => "Hex.pm",
         Some(RegistryType::PubDart) => "pub.dev",
         Some(RegistryType::Conan) => "Conan (C/C++)",
         Some(RegistryType::Rpm) => "RPM (yum/dnf)",
@@ -2226,7 +2237,7 @@ mod tests {
             false,
         );
         assert!(
-            html.contains("https://registry.example.com/simple"),
+            html.contains("https://registry.example.com/pypi/simple"),
             "PyPI install command must use public_url"
         );
         assert!(
@@ -2281,7 +2292,7 @@ mod tests {
         let html =
             render_package_detail("pypi", "flask", &empty_detail(), Lang::En, base_url, false);
         assert!(
-            html.contains("http://0.0.0.0:4000/simple"),
+            html.contains("http://0.0.0.0:4000/pypi/simple"),
             "Must use fallback host:port when public_url is not set"
         );
     }
@@ -2318,7 +2329,7 @@ mod tests {
         let base_url = "https://registry.example.com";
         let html = render_package_detail("pypi", "pkg", &empty_detail(), Lang::En, base_url, false);
         assert!(
-            !html.contains("com//simple"),
+            !html.contains("com//pypi/simple"),
             "Must not produce double slashes"
         );
     }
@@ -2344,6 +2355,41 @@ mod tests {
         assert!(html.contains("nra_test_token_123"));
         assert!(html.contains("refreshTokens"));
         assert!(html.contains("Copy"));
+    }
+
+    #[test]
+    fn test_hex_install_command() {
+        let mut detail = empty_detail();
+        detail.versions.push(crate::ui::api::VersionInfo {
+            version: "1.4.4".to_owned(),
+            size: 42,
+            published: "N/A".to_owned(),
+            cached: true,
+        });
+        let html = render_package_detail(
+            "hex",
+            "jason",
+            &detail,
+            Lang::En,
+            "https://packages.wistia.cloud/",
+            false,
+        );
+        assert!(html.contains("mix.exs"));
+        assert!(html.contains(&html_escape("{:jason, \"~> 1.4.4\"}")));
+        assert!(html.contains(&html_escape(
+            "HEX_MIRROR=\"https://packages.wistia.cloud/hex\" mix deps.get"
+        )));
+        assert!(!html.contains("cloud//hex"));
+        let html = render_package_detail(
+            "hex",
+            "jason",
+            &empty_detail(),
+            Lang::En,
+            "https://packages.wistia.cloud",
+            false,
+        );
+        assert!(html.contains(&html_escape("{:jason, \">= 0.0.0\"}")));
+        assert!(html.contains("mix deps.get"));
     }
 
     #[test]

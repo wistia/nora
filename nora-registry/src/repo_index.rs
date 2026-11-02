@@ -187,6 +187,7 @@ impl RepoIndex {
                     let (p, s) = crate::registry::ansible::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
                 }
+                RegistryType::Hex => build_hex_index(storage).await,
                 RegistryType::PubDart => {
                     let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
@@ -535,6 +536,25 @@ async fn build_generic_index(
         }
     }
 
+    Some(to_sorted_vec(packages))
+}
+
+/// Hex tarballs use a flat name-version layout; package names cannot contain hyphens.
+async fn build_hex_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "hex/tarballs/").await?;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for (key, meta) in keys {
+        if let Some((name, _)) = key
+            .strip_prefix("hex/tarballs/")
+            .and_then(|s| s.strip_suffix(".tar"))
+            .and_then(|s| s.split_once('-'))
+        {
+            let entry = packages.entry(name.to_owned()).or_default();
+            entry.0 += 1;
+            entry.1 += meta.size;
+            entry.2 = entry.2.max(meta.modified);
+        }
+    }
     Some(to_sorted_vec(packages))
 }
 

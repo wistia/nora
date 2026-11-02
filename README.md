@@ -46,13 +46,14 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/): the registry is rea
 | Ansible Galaxy | ✅ | — |
 | NuGet | ✅ | — |
 | Pub (Dart, Flutter) | ✅ | — |
+| Hex (Elixir) | opt-in | — |
 | Conan (C, C++) | ✅ | — |
 | CPAN | ✅ | — |
 | RPM (yum, dnf) | opt-in | ✅ |
 | Debian / APT | opt-in | ✅ |
 | Hugging Face Hub | opt-in | — |
 
-Opt-in: the Hugging Face proxy (`NORA_HF_ENABLED=true`) and RPM/Debian pull-through (`[rpm.proxies]`, `[deb.proxies]`). Default upstreams, protocol coverage and client notes for each format: [COMPAT.md](COMPAT.md).
+Opt-in: the [Hex mirror](docs/hex.md) (`NORA_HEX_ENABLED=true`), the Hugging Face proxy (`NORA_HF_ENABLED=true`) and RPM/Debian pull-through (`[rpm.proxies]`, `[deb.proxies]`). Default upstreams, protocol coverage and client notes for each format: [COMPAT.md](COMPAT.md).
 
 ## Install
 
@@ -73,7 +74,7 @@ docker push localhost:4000/myapp:latest
 npm config set registry http://localhost:4000/npm/
 
 # pip
-pip install --index-url http://localhost:4000/simple/ requests
+pip install --index-url http://localhost:4000/pypi/simple/ requests
 ```
 
 Every format has its own page with client setup, publishing and proxy options: [registries](https://getnora.dev/registries/docker/).

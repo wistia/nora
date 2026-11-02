@@ -181,6 +181,7 @@ fn build_context_full(
             s3_secret_key: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            s3_anonymous: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
         },
@@ -241,11 +242,15 @@ fn build_context_full(
             max_file_size: 1_048_576, // 1 MB
             cache_control: "no-cache".to_string(),
         },
-        gems: GemsConfig::default(),
+        gems: GemsConfig {
+            info_checksum_cache: false,
+            ..GemsConfig::default()
+        },
         terraform: TerraformConfig::default(),
         ansible: AnsibleConfig::default(),
         nuget: NugetConfig::default(),
         pub_dart: crate::config::PubDartConfig::default(),
+        hex: crate::config::HexConfig::default(),
         conan: crate::config::ConanConfig::default(),
         rpm: crate::config::RpmConfig {
             enabled: true,
@@ -386,6 +391,7 @@ fn build_context_full(
     };
     let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
+        gems_cache: Arc::default(),
         storage,
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),
@@ -600,6 +606,11 @@ pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
 
 #[async_trait::async_trait]
 impl crate::storage::StorageBackend for OpCountingBackend {
+    async fn create(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<bool> {
+        self.counts.hit("create");
+        self.inner.create(key, data, sha256).await
+    }
+
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.counts.hit("put");
         self.inner.put(key, data, sha256).await

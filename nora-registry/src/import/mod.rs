@@ -638,6 +638,7 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key:
         | crate::registry_type::RegistryType::Terraform
         | crate::registry_type::RegistryType::Ansible
         | crate::registry_type::RegistryType::PubDart
+        | crate::registry_type::RegistryType::Hex
         | crate::registry_type::RegistryType::Conan
         | crate::registry_type::RegistryType::Rpm
         | crate::registry_type::RegistryType::Deb
@@ -1767,13 +1768,13 @@ mod integration_tests {
             "{res:?}"
         );
 
-        let index = send(&ctx.app, Method::GET, "/simple/corppkg/", "").await;
+        let index = send(&ctx.app, Method::GET, "/pypi/simple/corppkg/", "").await;
         assert_eq!(index.status(), StatusCode::OK);
         let html = String::from_utf8(body_bytes(index).await.to_vec()).unwrap();
         let wheel_sha = hex::encode(Sha256::digest(&wheel));
         assert!(
             html.contains(&format!(
-                "/simple/corppkg/corppkg-1.0.0-py3-none-any.whl#sha256={wheel_sha}"
+                "/pypi/simple/corppkg/corppkg-1.0.0-py3-none-any.whl#sha256={wheel_sha}"
             )),
             "{html}"
         );
@@ -1782,7 +1783,7 @@ mod integration_tests {
         let json = crate::test_helpers::send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/",
+            "/pypi/simple/corppkg/",
             vec![("accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -1791,7 +1792,7 @@ mod integration_tests {
         let file = send(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/corppkg-1.0.0-py3-none-any.whl",
+            "/pypi/simple/corppkg/corppkg-1.0.0-py3-none-any.whl",
             "",
         )
         .await;
@@ -1800,7 +1801,7 @@ mod integration_tests {
         let other = send(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
+            "/pypi/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
             "",
         )
         .await;
@@ -1808,7 +1809,7 @@ mod integration_tests {
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
 
         // Control: a project nothing imported is still the upstream's.
-        send(&ctx.app, Method::GET, "/simple/requests/", "").await;
+        send(&ctx.app, Method::GET, "/pypi/simple/requests/", "").await;
         assert_eq!(
             asked(&upstream).await,
             vec!["/simple/requests/".to_string()]
@@ -1847,7 +1848,7 @@ mod integration_tests {
         crate::test_helpers::send_with_headers(
             app,
             axum::http::Method::POST,
-            "/simple/",
+            "/pypi/simple/",
             vec![("content-type", content_type.as_str())],
             body,
         )
@@ -1860,7 +1861,7 @@ mod integration_tests {
         let resp = crate::test_helpers::send(
             app,
             axum::http::Method::GET,
-            &format!("/simple/{project}/"),
+            &format!("/pypi/simple/{project}/"),
             "",
         )
         .await;
@@ -1940,7 +1941,7 @@ mod integration_tests {
         let json = crate::test_helpers::send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/",
+            "/pypi/simple/corppkg/",
             vec![("accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -1950,7 +1951,7 @@ mod integration_tests {
         let squatted = send(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
+            "/pypi/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
             "",
         )
         .await;
@@ -1958,7 +1959,7 @@ mod integration_tests {
         let uploaded = send(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/corppkg-1.0.1.tar.gz",
+            "/pypi/simple/corppkg/corppkg-1.0.1.tar.gz",
             "",
         )
         .await;
@@ -1981,7 +1982,7 @@ mod integration_tests {
         let own = send(
             &ctx.app,
             Method::GET,
-            "/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
+            "/pypi/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
             "",
         )
         .await;
@@ -2032,7 +2033,7 @@ mod integration_tests {
         let resp = send(
             &ctx.app,
             Method::GET,
-            &format!("/simple/corppkg/{wheel}"),
+            &format!("/pypi/simple/corppkg/{wheel}"),
             "",
         )
         .await;
@@ -2076,7 +2077,7 @@ mod integration_tests {
         send(
             &ctx.app,
             Method::GET,
-            "/simple/otherpkg/otherpkg-9.9.9-py3-none-any.whl",
+            "/pypi/simple/otherpkg/otherpkg-9.9.9-py3-none-any.whl",
             "",
         )
         .await;
@@ -2395,14 +2396,14 @@ mod integration_tests {
         crate::registry::pypi_claim_imported_project(&ctx.state.storage, "corppkg")
             .await
             .unwrap();
-        let index = send(&ctx.app, Method::GET, "/simple/corppkg/", "").await;
+        let index = send(&ctx.app, Method::GET, "/pypi/simple/corppkg/", "").await;
         let status = index.status();
         let html = String::from_utf8(body_bytes(index).await.to_vec()).unwrap();
         assert!(!html.contains(cached), "{status}: {html}");
         let file = send(
             &ctx.app,
             Method::GET,
-            &format!("/simple/corppkg/{cached}"),
+            &format!("/pypi/simple/corppkg/{cached}"),
             "",
         )
         .await;
@@ -2575,8 +2576,8 @@ mod integration_tests {
                 format: "pypi",
                 cached: "pypi/corppkg/corppkg-1.0.0-py3-none-any.whl",
                 source: "corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl",
-                listing: "/simple/corppkg/",
-                file: "/simple/corppkg/corppkg-1.0.0-py3-none-any.whl",
+                listing: "/pypi/simple/corppkg/",
+                file: "/pypi/simple/corppkg/corppkg-1.0.0-py3-none-any.whl",
                 name: "corppkg-1.0.0",
             },
             Case {
@@ -2700,7 +2701,7 @@ mod integration_tests {
         let file = send(
             &ctx.app,
             Method::GET,
-            &format!("/simple/corppkg/{cached}"),
+            &format!("/pypi/simple/corppkg/{cached}"),
             "",
         )
         .await;
@@ -2799,8 +2800,8 @@ mod integration_tests {
         });
         outage.begin();
         for path in [
-            "/simple/corppkg/",
-            "/simple/corppkg/corppkg-2.0.tar.gz",
+            "/pypi/simple/corppkg/",
+            "/pypi/simple/corppkg/corppkg-2.0.tar.gz",
             "/nuget/v3/flatcontainer/corp.lib/index.json",
             "/nuget/v3/flatcontainer/corp.lib/2.0.0/corp.lib.2.0.0.nupkg",
             "/nuget/v3/registration/corp.lib/index.json",

@@ -1134,7 +1134,7 @@ mod integration_tests {
             .circuit_breaker
             .record_failure(&key, ProbeToken::BACKGROUND);
 
-        let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/nonexistent/", "").await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -1216,7 +1216,13 @@ mod integration_tests {
         });
 
         // First file: #1 fails (and its breaker opens at threshold 1), #2 serves.
-        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/demo/demo-1.0.tar.gz",
+            "",
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -1228,14 +1234,20 @@ mod integration_tests {
 
         // #1's breaker is open now: the next file and the index skip #1 without
         // contacting it, and #2 still answers both.
-        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-2.0.tar.gz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/demo/demo-2.0.tar.gz",
+            "",
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
             "an open breaker on upstream #1 must not short-circuit upstream #2"
         );
         assert_eq!(&body_bytes(resp).await[..], b"demo-2.0.tar.gz");
-        let resp = send(&ctx.app, Method::GET, "/simple/demo/", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/demo/", "").await;
         assert_eq!(resp.status(), StatusCode::OK, "index merges what answered");
         assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("demo-2.0.tar.gz"));
         assert_eq!(
@@ -1289,12 +1301,24 @@ mod integration_tests {
         // Closed → the request reaches upstream, which fails → Open. (Its own
         // status is not pinned: the dates prefetch already trips threshold 1
         // before the page fetch, so this request may itself end in 503.)
-        send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/demo/demo-1.0.tar.gz",
+            "",
+        )
+        .await;
         let hits = upstream.received_requests().await.unwrap().len();
         assert!(hits > 0);
 
         // Open → 503 + Retry-After without contacting upstream.
-        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/demo/demo-1.0.tar.gz",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             resp.headers()
@@ -1322,7 +1346,13 @@ mod integration_tests {
             .await;
         let key = ctx.state.circuit_breaker.keys().remove(0);
         ctx.state.circuit_breaker.expire_open_for_test(&key);
-        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/demo/demo-1.0.tar.gz",
+            "",
+        )
+        .await;
         assert_ne!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1427,7 +1457,13 @@ mod integration_tests {
         );
 
         // Local read should still succeed
-        let response = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/flask/flask-2.0.tar.gz",
+            "",
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;

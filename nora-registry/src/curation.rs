@@ -161,6 +161,40 @@ impl CurationEngine {
         }
     }
 
+    /// A package exemption only disables cooldown gates, never other curation.
+    pub fn cooldown_exempt(&self, registry: RegistryType, name: &str) -> bool {
+        self.config.cooldown_exempt(registry, name)
+    }
+
+    pub fn cooldown_exempt_version(
+        &self,
+        registry: RegistryType,
+        name: &str,
+        version: Option<&str>,
+    ) -> bool {
+        self.config.cooldown_exempt_version(registry, name, version)
+    }
+
+    pub fn has_cooldown_exempt_versions_for(&self, registry: RegistryType, name: &str) -> bool {
+        self.config
+            .registry_override(registry)
+            .is_some_and(|section| {
+                section
+                    .cooldown_exempt_versions
+                    .iter()
+                    .any(|entry| entry.name == name)
+            })
+    }
+
+    pub fn has_cooldown_exempt_packages(&self, registry: RegistryType) -> bool {
+        self.config
+            .registry_override(registry)
+            .is_some_and(|section| {
+                !section.cooldown_exempt_packages.is_empty()
+                    || !section.cooldown_exempt_versions.is_empty()
+            })
+    }
+
     /// Add a filter to the end of the chain.
     /// Evaluation order = insertion order.
     pub fn add_filter(&mut self, filter: Box<dyn ProxyFilter>) {
@@ -1179,6 +1213,7 @@ pub fn curation_version(registry: RegistryType, version: &str) -> String {
         RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        RegistryType::Hex => pub_version_key(version).unwrap_or_else(|| version.to_string()),
         // A Hub commit is hex, served in lower case.
         RegistryType::HuggingFace => version.to_lowercase(),
         _ => version.to_string(),
@@ -1196,6 +1231,7 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
             RegistryType::Npm => npm_version_key(version),
             RegistryType::Go => go_version_key(version),
             RegistryType::PubDart => pub_version_key(version),
+            RegistryType::Hex => pub_version_key(version),
             _ => None,
         };
         // NuGet compares versions without case: the pattern and the spelling both fold.
@@ -1720,7 +1756,7 @@ impl ProxyFilter for AllowlistFilter {
                          cannot be matched against the allowlist",
                         request.name, request.registry
                     ),
-                }
+                };
             }
         };
 
@@ -1889,6 +1925,7 @@ pub struct MinReleaseAgeFilter {
     default: Option<(i64, String)>,
     /// Per-registry thresholds (seconds, label).
     overrides: std::collections::HashMap<RegistryType, (i64, String)>,
+    cooldown_exemptions: crate::config::CurationConfig,
 }
 
 impl MinReleaseAgeFilter {
@@ -1899,6 +1936,7 @@ impl MinReleaseAgeFilter {
         Self {
             default: Some((min_age_secs, label.to_string())),
             overrides: std::collections::HashMap::new(),
+            cooldown_exemptions: crate::config::CurationConfig::default(),
         }
     }
 
@@ -1934,8 +1972,11 @@ impl MinReleaseAgeFilter {
                 overrides.insert(rt, threshold);
             }
         }
-        let filter =
-            (default.is_some() || !overrides.is_empty()).then_some(Self { default, overrides });
+        let filter = (default.is_some() || !overrides.is_empty()).then_some(Self {
+            default,
+            overrides,
+            cooldown_exemptions: cfg.clone(),
+        });
         (filter, problems)
     }
 
@@ -1995,6 +2036,16 @@ impl ProxyFilter for MinReleaseAgeFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
+        if self.cooldown_exemptions.cooldown_exempt_version(
+            request.registry,
+            &request.name,
+            match &request.version {
+                RequestVersion::Known(version) => Some(version.as_str()),
+                _ => None,
+            },
+        ) {
+            return Decision::Skip;
+        }
         // Resolve the threshold for this registry first: a per-registry override
         // takes precedence over the global default.
         let Some((threshold, label)) = self.threshold(request.registry) else {
@@ -4628,6 +4679,7 @@ mod min_release_age_tests {
                 engine.add_filter(Box::new(Refuse));
                 if global || !own.is_empty() {
                     engine.add_filter(Box::new(MinReleaseAgeFilter {
+                        cooldown_exemptions: crate::config::CurationConfig::default(),
                         default: global.then(hour),
                         overrides: own.iter().map(|&r| (r, hour())).collect(),
                     }));
@@ -5012,7 +5064,7 @@ mod rule_names_in_published_spelling {
         });
         for uri in [
             "/nuget/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
-            "/simple/flask-restful/Flask-RESTful-0.3.9.tar.gz",
+            "/pypi/simple/flask-restful/Flask-RESTful-0.3.9.tar.gz",
             "/cargo/api/v1/crates/Inflector/0.11.4/download",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
@@ -5037,7 +5089,7 @@ mod rule_names_in_published_spelling {
         });
         for uri in [
             "/nuget/v3/flatcontainer/corp.internal/1.0.0/corp.internal.1.0.0.nupkg",
-            "/simple/corp-tools/",
+            "/pypi/simple/corp-tools/",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert!(!resp.status().is_success(), "{uri}: {}", resp.status());
@@ -5969,5 +6021,142 @@ mod pypi_files_as_pip_reads_them {
             parse_pypi_version(&project, "flask-1.0.tar.gz").as_deref(),
             Some("1.0")
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod exact_version_curation_tests {
+    use super::*;
+
+    fn config(registry: RegistryType, name: &str, version: &str) -> CurationConfig {
+        let mut value = serde_json::json!({"mode": "enforce", "min_release_age": "7d"});
+        value[registry.to_string()] = serde_json::json!({
+            "cooldown_exempt_versions": [{"name": name, "version": version}]
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn request(registry: RegistryType, name: &str, version: RequestVersion) -> FilterRequest {
+        FilterRequest {
+            registry,
+            name: name.into(),
+            version,
+            upstream: None,
+            integrity: None,
+            bypass: false,
+            publish_date: Some(chrono::Utc::now().timestamp()),
+        }
+    }
+
+    #[test]
+    fn exact_version_skips_age_without_admitting_siblings_or_unknown_versions() {
+        for (registry, name, version, alias, sibling) in [
+            (RegistryType::Gems, "trilogy", "2.13.2", "2.13.2", "2.13.1"),
+            (
+                RegistryType::Npm,
+                "@example/player",
+                "1.2.3",
+                "v1.2.3",
+                "1.2.4",
+            ),
+            (
+                RegistryType::Go,
+                "example.com/module",
+                "v1.2.0",
+                "v1.2",
+                "v1.2.1",
+            ),
+            (
+                RegistryType::Hex,
+                "example_package",
+                "1.2.3",
+                "1.2.3",
+                "1.2.4",
+            ),
+        ] {
+            let cfg = config(registry, name, version);
+            let (filter, errors) = MinReleaseAgeFilter::from_config(&cfg);
+            assert!(errors.is_empty());
+            let filter = filter.unwrap();
+            assert_eq!(
+                filter.evaluate(&request(
+                    registry,
+                    name,
+                    RequestVersion::Known(alias.into())
+                )),
+                Decision::Skip
+            );
+            for version in [
+                RequestVersion::Known(sibling.into()),
+                RequestVersion::Unrecognised,
+                RequestVersion::Unspecified,
+            ] {
+                assert!(matches!(
+                    filter.evaluate(&request(registry, name, version)),
+                    Decision::Block { .. }
+                ));
+            }
+            assert!(matches!(
+                filter.evaluate(&request(
+                    registry,
+                    "other",
+                    RequestVersion::Known(version.into())
+                )),
+                Decision::Block { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn rebuilt_age_filter_restores_hold_when_exact_exemption_is_removed() {
+        let mut cfg = config(RegistryType::Gems, "trilogy", "2.13.2");
+        let req = request(
+            RegistryType::Gems,
+            "trilogy",
+            RequestVersion::Known("2.13.2".into()),
+        );
+        let (before, _) = MinReleaseAgeFilter::from_config(&cfg);
+        cfg.gems.cooldown_exempt_versions.clear();
+        let (after, _) = MinReleaseAgeFilter::from_config(&cfg);
+        assert_eq!(before.unwrap().evaluate(&req), Decision::Skip);
+        assert!(matches!(
+            after.unwrap().evaluate(&req),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_exemptions_do_not_short_circuit_other_filters() {
+        let cfg = config(RegistryType::Gems, "trilogy", "2.13.2");
+        let req = request(
+            RegistryType::Gems,
+            "trilogy",
+            RequestVersion::Known("2.13.2".into()),
+        );
+        let (age, _) = MinReleaseAgeFilter::from_config(&cfg);
+        let mut engine = CurationEngine::new(cfg);
+        engine.add_filter(Box::new(AllowlistFilter {
+            entries: HashMap::new(),
+            require_integrity: false,
+        }));
+        engine.add_filter(Box::new(age.unwrap()));
+        let result = engine.evaluate(&req);
+        assert!(matches!(result.decision, Decision::Block { .. }));
+        assert_eq!(result.decided_by.as_deref(), Some("allowlist"));
+
+        let cfg = config(RegistryType::Gems, "trilogy", "2.13.2");
+        let (age, _) = MinReleaseAgeFilter::from_config(&cfg);
+        let mut engine = CurationEngine::new(cfg);
+        engine.add_filter(Box::new(BlocklistFilter::new(vec![BlocklistRule {
+            registry: "gems".into(),
+            name: "trilogy".into(),
+            version: "2.13.2".into(),
+            reason: "test denial".into(),
+        }])));
+        engine.add_filter(Box::new(age.unwrap()));
+        let result = engine.evaluate(&req);
+        assert!(matches!(result.decision, Decision::Block { .. }));
+        assert_eq!(result.decided_by.as_deref(), Some("blocklist"));
     }
 }

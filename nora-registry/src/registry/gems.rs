@@ -19,8 +19,8 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, proxy_fetch, proxy_fetch_conditional, read_validators, write_validators,
-    ProxyError, Revalidation, Validators,
+    circuit_open_response, proxy_fetch, proxy_fetch_conditional_with_cache_control, ProxyError,
+    Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -35,6 +35,47 @@ use axum::{
 };
 use std::time::Duration;
 
+// Extend the existing validator sidecar; old sidecars remain readable.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct IndexMetadata {
+    #[serde(flatten)]
+    pub(super) validators: Validators,
+    #[serde(default)]
+    pub(super) cache_control: Option<String>,
+}
+
+pub(super) async fn read_index_metadata(state: &AppState, key: &str) -> IndexMetadata {
+    let key = crate::registry::validators_key(key);
+    state
+        .storage
+        .get(&key)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub(super) async fn write_index_metadata(
+    storage: &crate::Storage,
+    key: &str,
+    metadata: &IndexMetadata,
+) {
+    if let Ok(bytes) = serde_json::to_vec(metadata) {
+        let key = crate::registry::validators_key(key);
+        if let Err(e) = storage.put(&key, &bytes).await {
+            tracing::warn!(key = %key, error = ?e, "gems proxy: failed to cache index metadata");
+        }
+    }
+}
+
+fn with_upstream_cache_control(mut response: Response, cache_control: Option<&str>) -> Response {
+    response.headers_mut().remove(header::CACHE_CONTROL);
+    if let Some(value) = cache_control.and_then(|value| HeaderValue::from_str(value).ok()) {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         // Index files (mutable)
@@ -43,7 +84,7 @@ pub fn routes() -> Router<AppState> {
         .route("/gems/prerelease_specs.4.8.gz", get(prerelease_specs_index))
         // Compact index (mutable)
         .route("/gems/versions", get(versions_index))
-        .route("/gems/info/{name}", get(compact_index))
+        .route("/gems/info/{name}", get(compact_index_with_cache_policy))
         // Gem download (immutable) — wildcard because axum forbids two params per segment
         .route("/gems/gems/{filename}", get(download_gem))
         // Gemspec (immutable)
@@ -69,32 +110,45 @@ async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
 // Keep upstream versions and info documents unchanged: their checksums refer to
 // each other. Download gates continue to enforce server-side cooldown policy.
 async fn versions_index(State(state): State<AppState>) -> Response {
-    fetch_index(&state, "versions").await
+    let response =
+        fetch_index_with_ttl(&state, "versions", super::gems_cache::versions_ttl(&state)).await;
+    versions_cache_policy(
+        response,
+        state.config.gems.versions_stale_while_revalidate,
+        state.config.gems.versions_stale_if_error,
+    )
 }
 
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
+    fetch_index_with_ttl(state, filename, state.config.gems.metadata_ttl).await
+}
+
+pub(super) async fn fetch_index_with_ttl(state: &AppState, filename: &str, ttl: i64) -> Response {
     let content_type = if filename == "versions" {
         "text/plain; charset=utf-8"
     } else {
         "application/gzip"
     };
-    let index_response = |data: Vec<u8>| {
-        let mut response = with_binary(data, content_type);
+    let index_response = |data: Vec<u8>, cache_control: Option<&str>| {
+        let response = with_binary(data, content_type);
         if filename == "versions" {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=3600, must-revalidate"),
-            );
+            with_upstream_cache_control(response, cache_control)
+        } else {
+            response
         }
-        response
     };
     let storage_key = format!("gems/{}", filename);
-
-    // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, metadata) = tokio::join!(state.storage.get(&storage_key), async {
+        if filename == "versions" {
+            read_index_metadata(state, &storage_key).await
+        } else {
+            IndexMetadata::default()
+        }
+    });
+    let cached_data = cached_data.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
+            if is_within_ttl(meta.modified, ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit("gems");
                 state.activity.push(ActivityEntry::new(
@@ -103,7 +157,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                     crate::registry_type::RegistryType::Gems,
                     "CACHE",
                 ));
-                return index_response(data.to_vec());
+                return index_response(data.to_vec(), metadata.cache_control.as_deref());
             }
         }
     }
@@ -111,23 +165,81 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     // Fetch from upstream — none when the operator switched it off: what is stored is all there is.
     let Some(proxy_url) = upstream_url(state) else {
         return match cached_data {
-            Some(data) => index_response(data.to_vec()),
+            Some(data) => index_response(data.to_vec(), metadata.cache_control.as_deref()),
             None => StatusCode::NOT_FOUND.into_response(),
         };
     };
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), filename);
 
-    match proxy_fetch(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.gems.proxy_timeout),
-        expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
-        &state.circuit_breaker,
-        RegistryType::Gems,
-    )
-    .await
-    {
-        Ok(bytes) => {
+    // Only send validators when the matching cached body is available.
+    let result = if filename == "versions" {
+        let validators = if cached_data.is_some() && state.config.gems.revalidate {
+            metadata.validators.clone()
+        } else {
+            Validators::default()
+        };
+        proxy_fetch_conditional_with_cache_control(
+            &state.http_client,
+            &url,
+            Duration::from_secs(state.config.gems.proxy_timeout),
+            expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
+            &validators,
+            &state.circuit_breaker,
+            RegistryType::Gems,
+        )
+        .await
+    } else {
+        proxy_fetch(
+            &state.http_client,
+            &url,
+            Duration::from_secs(state.config.gems.proxy_timeout),
+            expose_opt(&state.config.gems.proxy_auth).map(UpstreamAuth::Basic),
+            &state.circuit_breaker,
+            RegistryType::Gems,
+        )
+        .await
+        .map(|body| {
+            (
+                Revalidation::Modified {
+                    body,
+                    validators: Validators::default(),
+                },
+                None,
+            )
+        })
+    };
+
+    match result {
+        Ok((Revalidation::NotModified, cache_control)) => {
+            let Some(data) = cached_data else {
+                return StatusCode::BAD_GATEWAY.into_response();
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["gems"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["gems"])
+                .inc_by(data.len() as u64);
+            state.metrics.record_download("gems");
+            state.metrics.record_cache_hit("gems");
+            let metadata = IndexMetadata {
+                validators: metadata.validators,
+                cache_control: cache_control.or(metadata.cache_control),
+            };
+            write_index_metadata(&state.storage, &storage_key, &metadata).await;
+            // Refresh the cache timestamp without downloading the index again.
+            if let Err(e) = state.storage.put(&storage_key, &data).await {
+                tracing::warn!(key = %storage_key, error = ?e, "gems proxy: failed to refresh versions index");
+            }
+            index_response(data.to_vec(), metadata.cache_control.as_deref())
+        }
+        Ok((
+            Revalidation::Modified {
+                body: bytes,
+                validators,
+            },
+            cache_control,
+        )) => {
             state.metrics.record_download("gems");
             state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
@@ -140,9 +252,29 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
-            // Cache in background (overwrite — mutable content)
-            state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
-            index_response(bytes)
+            if filename == "versions" {
+                // Persist the body before its validators, including empty validators
+                // so an upstream that stops sending them cannot leave old ones behind.
+                match state.storage.put(&storage_key, &bytes).await {
+                    Ok(()) => {
+                        write_index_metadata(
+                            &state.storage,
+                            &storage_key,
+                            &IndexMetadata {
+                                validators,
+                                cache_control: cache_control.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %storage_key, error = ?e, "gems proxy: failed to cache versions index")
+                    }
+                }
+            } else {
+                state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
+            }
+            index_response(bytes, cache_control.as_deref())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -181,6 +313,122 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
 
 // ── Compact index ──────────────────────────────────────────────────────
 
+// Apply downstream policy at the route boundary, covering checksum, legacy and
+// offline paths without changing the upstream policy retained in shared storage.
+async fn compact_index_with_cache_policy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    let response = compact_index(State(state.clone()), headers, Path(name.clone())).await;
+    let exempt = state
+        .curation()
+        .curation_engine
+        .cooldown_exempt(RegistryType::Gems, &name)
+        || state
+            .curation()
+            .curation_engine
+            .has_cooldown_exempt_versions_for(RegistryType::Gems, &name);
+    let ttl = if exempt {
+        state
+            .config
+            .gems
+            .exempt_info_http_max_age
+            .min(state.config.gems.info_http_max_age)
+    } else {
+        state.config.gems.info_http_max_age
+    };
+    let cfg = &state.config.gems;
+    let (swr, sie) = if exempt {
+        (
+            cfg.exempt_info_stale_while_revalidate
+                .min(cfg.info_stale_while_revalidate),
+            cfg.exempt_info_stale_if_error.min(cfg.info_stale_if_error),
+        )
+    } else {
+        (cfg.info_stale_while_revalidate, cfg.info_stale_if_error)
+    };
+    info_cache_policy(response, ttl, swr, sie)
+}
+
+fn allows_stale_policy(response: &Response) -> bool {
+    let restricted = response
+        .headers()
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                value.split(',').any(|directive| {
+                    let name = directive.trim().split('=').next().unwrap_or("").trim();
+                    ["no-store", "private", "no-cache"]
+                        .iter()
+                        .any(|restricted| name.eq_ignore_ascii_case(restricted))
+                })
+            })
+        });
+    response.status() == StatusCode::OK
+        && !response.headers().contains_key("x-nora-stale")
+        && !restricted
+}
+
+fn append_stale_windows(policy: &mut String, swr: u64, sie: u64) {
+    if swr > 0 {
+        policy.push_str(&format!(", stale-while-revalidate={swr}"));
+    }
+    if sie > 0 {
+        policy.push_str(&format!(", stale-if-error={sie}"));
+    }
+}
+
+fn versions_cache_policy(mut response: Response, swr: u64, sie: u64) -> Response {
+    if !allows_stale_policy(&response) {
+        return response;
+    }
+    // Keep upstream freshness and other directives, replacing only stale windows.
+    // No upstream Cache-Control means no explicit freshness policy to extend.
+    let values: Vec<_> = response
+        .headers()
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .collect();
+    if values.is_empty() {
+        return response;
+    }
+    let mut directives = Vec::new();
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return response;
+        };
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            let name = directive.split('=').next().unwrap_or("").trim();
+            if !["stale-while-revalidate", "stale-if-error"]
+                .iter()
+                .any(|stale| name.eq_ignore_ascii_case(stale))
+            {
+                directives.push(directive.to_string());
+            }
+        }
+    }
+    let mut policy = directives.join(", ");
+    append_stale_windows(&mut policy, swr, sie);
+    if let Ok(value) = HeaderValue::from_str(&policy) {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
+fn info_cache_policy(mut response: Response, ttl: u64, swr: u64, sie: u64) -> Response {
+    if allows_stale_policy(&response) {
+        let mut policy = format!("public, max-age={ttl}");
+        append_stale_windows(&mut policy, swr, sie);
+        if let Ok(value) = HeaderValue::from_str(&policy) {
+            response.headers_mut().insert(header::CACHE_CONTROL, value);
+        }
+    }
+    response
+}
+
 async fn compact_index(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -211,10 +459,20 @@ async fn compact_index(
         }
     }
 
+    if !internal && upstream_url(&state).is_some() && state.config.gems.info_checksum_cache {
+        if let Some(response) = super::gems_cache::info(&state, &name).await {
+            return response;
+        }
+    }
+
     let storage_key = format!("gems/info/{}", name);
 
     // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, metadata) = tokio::join!(
+        state.storage.get(&storage_key),
+        read_index_metadata(&state, &storage_key)
+    );
+    let cached_data = cached_data.ok();
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
@@ -226,7 +484,10 @@ async fn compact_index(
                     crate::registry_type::RegistryType::Gems,
                     "CACHE",
                 ));
-                return with_text(data.to_vec());
+                return with_upstream_cache_control(
+                    with_text(data.to_vec()),
+                    metadata.cache_control.as_deref(),
+                );
             }
         }
     }
@@ -236,7 +497,10 @@ async fn compact_index(
         if let Some(ref data) = cached_data {
             state.metrics.record_download("gems");
             state.metrics.record_cache_hit("gems");
-            return with_text(data.to_vec());
+            return with_upstream_cache_control(
+                with_text(data.to_vec()),
+                metadata.cache_control.as_deref(),
+            );
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -248,7 +512,15 @@ async fn compact_index(
 
     let Some(proxy_url) = upstream_url(&state) else {
         return match cached_data {
-            Some(data) => with_text(data.to_vec()),
+            Some(data) => with_upstream_cache_control(
+                with_text(data.to_vec()),
+                metadata.cache_control.as_deref(),
+            ),
+            None if !internal && state.config.gems.info_checksum_cache => {
+                super::gems_cache::offline_info(&state, &name)
+                    .await
+                    .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         };
     };
@@ -259,15 +531,13 @@ async fn compact_index(
     // a full fetch otherwise. Empty validators ⇒ no conditional headers ⇒ always
     // a 200, which is also how the first fetch captures validators for next time.
     let validators = if state.config.gems.revalidate {
-        read_validators(&state.storage, &storage_key)
-            .await
-            .unwrap_or_default()
+        metadata.validators.clone()
     } else {
         Validators::default()
     };
     let had_validators = validators.is_some();
 
-    match proxy_fetch_conditional(
+    match proxy_fetch_conditional_with_cache_control(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.gems.proxy_timeout),
@@ -280,15 +550,18 @@ async fn compact_index(
     {
         // Upstream unchanged — serve the cached body and bump its freshness so we
         // do not revalidate again until the next TTL window. No body downloaded.
-        Ok(Revalidation::NotModified) => {
-            let cached = match state.storage.get(&storage_key).await {
-                Ok(b) => b,
-                // Body vanished under us — use the eagerly-read copy, or 502.
-                Err(_) => match cached_data {
-                    Some(b) => b,
-                    None => return StatusCode::BAD_GATEWAY.into_response(),
-                },
+        Ok((Revalidation::NotModified, cache_control)) => {
+            let Some(cached) = cached_data else {
+                return StatusCode::BAD_GATEWAY.into_response();
             };
+            let metadata = IndexMetadata {
+                validators: metadata.validators,
+                cache_control: cache_control.or(metadata.cache_control),
+            };
+            let response = with_upstream_cache_control(
+                with_text(cached.to_vec()),
+                metadata.cache_control.as_deref(),
+            );
             crate::metrics::PROXY_UPSTREAM_304_TOTAL
                 .with_label_values(&["gems"])
                 .inc();
@@ -300,14 +573,16 @@ async fn compact_index(
             // Re-put bumps the file mtime (the freshness source) without download.
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
-            let body = cached.clone();
+            let body = cached;
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &body).await;
+                if storage.put(&key_clone, &body).await.is_ok() {
+                    write_index_metadata(&storage, &key_clone, &metadata).await;
+                }
             });
-            with_text(cached.to_vec())
+            response
         }
         // New body — cache the raw bytes first, then persist the fresh validators.
-        Ok(Revalidation::Modified { body, validators }) => {
+        Ok((Revalidation::Modified { body, validators }, cache_control)) => {
             state.metrics.record_download("gems");
             state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
@@ -320,18 +595,23 @@ async fn compact_index(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
-            let raw = Bytes::from(body);
+            let response =
+                with_upstream_cache_control(with_text(body.clone()), cache_control.as_deref());
+            let metadata = IndexMetadata {
+                validators,
+                cache_control,
+            };
+            let raw_for_cache = Bytes::from(body);
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
-            let raw_for_cache = raw.clone();
             tokio::spawn(async move {
                 if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
                     tracing::warn!(key = %key_clone, error = ?e, "gems proxy: failed to cache compact index");
                     return;
                 }
-                write_validators(&storage, &key_clone, &validators).await;
+                write_index_metadata(&storage, &key_clone, &metadata).await;
             });
-            with_text(raw.to_vec())
+            response
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -439,21 +719,8 @@ async fn download_gem(
     };
     let cached_meta = state.storage.stat(&storage_key).await;
 
-    // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-        state.config.curation.gems.quarantine.as_ref().or(state
-            .config
-            .curation
-            .quarantine
-            .as_ref()),
-        state
-            .config
-            .curation
-            .gems
-            .quarantine_ttl
-            .as_deref()
-            .or(state.config.curation.quarantine_ttl.as_deref()),
-    );
+    // Resolve once so cache, upstream and Range responses use the same policy.
+    let (q_mode, q_secs) = effective_quarantine(&state, &identities);
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. .gem files only — the specs/compact indexes are mutable. A
@@ -523,7 +790,8 @@ async fn download_gem(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            &state.storage,
             &state.digest_store,
             "gems",
             &data,
@@ -531,7 +799,9 @@ async fn download_gem(
             q_secs,
             "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         let mut response = with_binary(data.to_vec(), "application/octet-stream");
@@ -599,7 +869,8 @@ async fn download_gem(
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                &state.storage,
                 &state.digest_store,
                 "gems",
                 &bytes,
@@ -607,7 +878,9 @@ async fn download_gem(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes, "application/octet-stream")
@@ -640,11 +913,13 @@ async fn download_gemspec(
     let GemFileGate {
         internal,
         publish_date,
-        ..
+        identities,
     } = match gem_file_gate(&state, &headers, stem, &storage_key).await {
         Ok(gate) => gate,
         Err(refusal) => return *refusal,
     };
+
+    let (q_mode, q_secs) = effective_quarantine(&state, &identities);
 
     // Immutable cache. get_verified discharges the integrity witness at serve.
     let (cached, read_failure) =
@@ -663,21 +938,8 @@ async fn download_gemspec(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.gems.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .gems
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            &state.storage,
             &state.digest_store,
             "gems",
             &data,
@@ -685,7 +947,9 @@ async fn download_gemspec(
             q_secs,
             "cache",
             publish_date,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         return with_binary(data.to_vec(), "application/octet-stream");
@@ -740,21 +1004,8 @@ async fn download_gemspec(
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.gems.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .gems
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                &state.storage,
                 &state.digest_store,
                 "gems",
                 &bytes,
@@ -762,7 +1013,9 @@ async fn download_gemspec(
                 q_secs,
                 &url,
                 publish_date,
-            ) {
+            )
+            .await
+            {
                 return resp;
             }
             with_binary(bytes, "application/octet-stream")
@@ -774,6 +1027,42 @@ async fn download_gemspec(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// A gem and its gemspec must apply the same all-identities exemption rule.
+/// Load one curation snapshot so a reload cannot mix exemption sets mid-check.
+fn effective_quarantine(
+    state: &AppState,
+    identities: &[GemFile],
+) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.gems.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .gems
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+
+    let curation = state.curation();
+    if !identities.is_empty()
+        && identities.iter().all(|identity| {
+            curation.curation_engine.cooldown_exempt_version(
+                RegistryType::Gems,
+                &identity.name,
+                Some(&identity.version),
+            )
+        })
+    {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
+    }
+    (q_mode, q_secs)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1280,38 +1569,63 @@ pub fn split_gem_filename(stem: &str) -> Option<(String, String)> {
 /// Whether a compact index (`/info/<name>`) lists a reading: its rows after `---` start with
 /// `version` or `version-platform` (rubygems `resolver/api_set/gem_parser.rb` splits that
 /// field at its first `-`).
-fn compact_index_lists(index: &str, file: &GemFile) -> bool {
-    let wanted = match &file.platform {
-        Some(platform) => format!("{}-{}", file.version, platform),
-        None => file.version.clone(),
-    };
-    let lines: Vec<&str> = index.lines().collect();
-    let rows = match lines.iter().position(|line| *line == "---") {
-        Some(header) => &lines[header + 1..],
-        None => &lines[..],
-    };
-    rows.iter()
-        .any(|row| row.split(' ').next() == Some(wanted.as_str()))
+fn compact_index_lists(versions: &std::collections::HashSet<String>, file: &GemFile) -> bool {
+    let wanted = file.platform.as_ref().map_or_else(
+        || file.version.clone(),
+        |platform| format!("{}-{platform}", file.version),
+    );
+    versions.contains(&wanted)
 }
 
 /// The readings of a gem file name curation decides on. One reading is the file. Of several,
-/// those the compact index NORA holds for their gem lists (`gems/info/<name>`: upstream's own
+/// those the checksum-selected compact index NORA holds for their gem lists (upstream's own
 /// record of which versions and platforms exist; RubyGems gives a file name to one gem only,
 /// so a listed reading is the file) — and every reading while none is listed.
-async fn gem_file_identities(state: &AppState, readings: Vec<GemFile>) -> Vec<GemFile> {
+pub(super) async fn gem_file_identities(state: &AppState, readings: Vec<GemFile>) -> Vec<GemFile> {
     if readings.len() < 2 {
+        return readings;
+    }
+    use futures::StreamExt;
+    let names: std::collections::HashSet<_> = readings
+        .iter()
+        .map(|reading| reading.name.clone())
+        .collect();
+    let indexes: std::collections::HashMap<_, _> = futures::stream::iter(names)
+        .map(|name| async move {
+            let versions = match super::gems_cache::cached_info(state, &name).await {
+                super::gems_cache::CachedInfo::Managed {
+                    document: Some(document),
+                    fresh: true,
+                    ..
+                } => (Some(document.versions().clone()), false),
+                super::gems_cache::CachedInfo::Managed { .. } => (None, true), // unknown/stale: weigh every possible identity
+                super::gems_cache::CachedInfo::Legacy => (
+                    state
+                        .storage
+                        .get(&format!("gems/info/{name}"))
+                        .await
+                        .ok()
+                        .map(|body| {
+                            super::gems_cache::version_tokens(&String::from_utf8_lossy(&body))
+                        }),
+                    false,
+                ),
+            };
+            (name, versions)
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    if indexes.values().any(|(_, unresolved)| *unresolved) {
         return readings;
     }
     let mut listed = Vec::new();
     for reading in &readings {
-        let Ok(index) = state
-            .storage
-            .get(&format!("gems/info/{}", reading.name))
-            .await
-        else {
-            continue;
-        };
-        if compact_index_lists(&String::from_utf8_lossy(&index), reading) {
+        if indexes
+            .get(&reading.name)
+            .and_then(|(versions, _)| versions.as_ref())
+            .is_some_and(|versions| compact_index_lists(versions, reading))
+        {
             listed.push(reading.clone());
         }
     }
@@ -1459,7 +1773,7 @@ const GEM_FILE_STEM_MAX: usize = GEM_NAME_MAX + 1 + GEM_VERSION_MAX + 1 + GEM_NA
 
 /// Validate gem name: alphanumeric, hyphens, underscores, dots.
 /// No path traversal, no slashes, no null bytes.
-fn is_valid_gem_name(name: &str) -> bool {
+pub(super) fn is_valid_gem_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= GEM_NAME_MAX
         && !name.contains('/')
@@ -1585,6 +1899,241 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    #[tokio::test]
+    async fn info_http_policy_splits_exempt_names_on_cached_and_offline_paths() {
+        for checksum_cache in [false, true] {
+            for proxy in [None, Some("http://127.0.0.1:1".to_string())] {
+                let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+                    cfg.gems.enabled = true;
+                    cfg.gems.proxy = proxy;
+                    cfg.gems.info_checksum_cache = checksum_cache;
+                    cfg.curation.gems.cooldown_exempt_packages = vec!["rails".into()];
+                });
+                for (name, policy) in [
+                    (
+                        "rake",
+                        "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000",
+                    ),
+                    (
+                        "rails",
+                        "public, max-age=60, stale-while-revalidate=259200, stale-if-error=432000",
+                    ),
+                ] {
+                    ctx.state
+                        .storage
+                        .put(&format!("gems/info/{name}"), b"---\n1.0.0\n")
+                        .await
+                        .unwrap();
+                    let response =
+                        send(&ctx.app, Method::GET, &format!("/gems/info/{name}"), "").await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()[header::CACHE_CONTROL], policy);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn info_http_policy_uses_configured_lifetimes_and_reloaded_exemptions() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            cfg.gems.info_http_max_age = 120;
+            cfg.gems.info_stale_while_revalidate = 15;
+            cfg.gems.info_stale_if_error = 90;
+            cfg.gems.exempt_info_stale_while_revalidate = 5;
+            cfg.gems.exempt_info_stale_if_error = 20;
+            cfg.gems.exempt_info_http_max_age = 10;
+        });
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"---\n1.0.0\n")
+            .await
+            .unwrap();
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=120, stale-while-revalidate=15, stale-if-error=90"
+        );
+        let mut updated = (*ctx.state.config).clone();
+        updated.curation.gems.cooldown_exempt_packages = vec!["rails".into()];
+        ctx.state
+            .reloadable
+            .store(std::sync::Arc::new(crate::ReloadableConfig {
+                curation_engine: crate::build_curation_engine(&updated).unwrap(),
+                bypass_token: None,
+            }));
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=10, stale-while-revalidate=5, stale-if-error=20"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_version_exemption_updates_info_http_policy_on_reload() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            cfg.gems.info_http_max_age = 120;
+            cfg.gems.info_stale_while_revalidate = 15;
+            cfg.gems.info_stale_if_error = 90;
+            cfg.gems.exempt_info_stale_while_revalidate = 5;
+            cfg.gems.exempt_info_stale_if_error = 20;
+            cfg.gems.exempt_info_http_max_age = 10;
+        });
+        ctx.state
+            .storage
+            .put("gems/info/rails", b"---\n1.0.0\n")
+            .await
+            .unwrap();
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=120, stale-while-revalidate=15, stale-if-error=90"
+        );
+        let mut updated = (*ctx.state.config).clone();
+        updated.curation.gems.cooldown_exempt_versions =
+            vec![
+                serde_json::from_value(serde_json::json!({"name":"rails", "version":"1.0.0"}))
+                    .unwrap(),
+            ];
+        ctx.state
+            .reloadable
+            .store(std::sync::Arc::new(crate::ReloadableConfig {
+                curation_engine: crate::build_curation_engine(&updated).unwrap(),
+                bypass_token: None,
+            }));
+        let response = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=10, stale-while-revalidate=5, stale-if-error=20"
+        );
+    }
+
+    #[test]
+    fn versions_stale_policy_preserves_freshness_and_replaces_existing_windows() {
+        use axum::response::IntoResponse;
+        let response = || {
+            let mut response = StatusCode::OK.into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "max-age=42, public, Stale-While-Revalidate=99, stale-if-error=99"
+                    .parse()
+                    .unwrap(),
+            );
+            response
+        };
+        let updated = super::versions_cache_policy(response(), 30, 300);
+        assert_eq!(
+            updated.headers()[header::CACHE_CONTROL],
+            "max-age=42, public, stale-while-revalidate=30, stale-if-error=300"
+        );
+        let disabled = super::versions_cache_policy(response(), 0, 0);
+        assert_eq!(
+            disabled.headers()[header::CACHE_CONTROL],
+            "max-age=42, public"
+        );
+        let missing = super::versions_cache_policy(StatusCode::OK.into_response(), 30, 300);
+        assert!(!missing.headers().contains_key(header::CACHE_CONTROL));
+    }
+
+    #[test]
+    fn info_http_policy_stale_windows_are_independent_and_optional() {
+        use axum::response::IntoResponse;
+        for (swr, sie, expected) in [
+            (0, 0, "public, max-age=60"),
+            (5, 0, "public, max-age=60, stale-while-revalidate=5"),
+            (0, 10, "public, max-age=60, stale-if-error=10"),
+            (
+                5,
+                10,
+                "public, max-age=60, stale-while-revalidate=5, stale-if-error=10",
+            ),
+        ] {
+            let response = super::info_cache_policy(StatusCode::OK.into_response(), 60, swr, sie);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], expected);
+        }
+    }
+
+    #[test]
+    fn info_http_policy_preserves_errors_stale_and_restricted_responses() {
+        use axum::response::IntoResponse;
+        for policy in ["private", "public, no-store", "No-Cache=\"etag\""] {
+            let mut response = StatusCode::OK.into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, policy.parse().unwrap());
+            let versions = super::versions_cache_policy(response, 30, 300);
+            assert_eq!(versions.headers()[header::CACHE_CONTROL], policy);
+            let mut response = StatusCode::OK.into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, policy.parse().unwrap());
+            assert_eq!(
+                super::info_cache_policy(response, 86400, 300, 86400).headers()
+                    [header::CACHE_CONTROL],
+                policy
+            );
+        }
+        for (status, stale) in [(StatusCode::BAD_GATEWAY, false), (StatusCode::OK, true)] {
+            let mut response = status.into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "public, max-age=0, must-revalidate".parse().unwrap(),
+            );
+            if stale {
+                response
+                    .headers_mut()
+                    .insert("x-nora-stale", "true".parse().unwrap());
+            }
+            assert_eq!(
+                super::info_cache_policy(response, 86400, 300, 86400).headers()
+                    [header::CACHE_CONTROL],
+                "public, max-age=0, must-revalidate"
+            );
+        }
+        let response = super::info_cache_policy(StatusCode::OK.into_response(), 0, 0, 0);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=0"
+        );
+    }
+
+    #[test]
+    fn quarantine_exemption_requires_every_identity_in_one_curation_snapshot() {
+        use crate::digest_quarantine::QuarantineMode;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+            cfg.curation.gems.cooldown_exempt_packages = vec!["private_gem".into()];
+        });
+        let private = super::GemFile {
+            name: "private_gem".into(),
+            version: "1.0.0".into(),
+            platform: None,
+        };
+        let ordinary = super::GemFile {
+            name: "ordinary_gem".into(),
+            version: "1.0.0".into(),
+            platform: None,
+        };
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, std::slice::from_ref(&private)).0,
+            QuarantineMode::Off
+        ));
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, &[private, ordinary]).0,
+            QuarantineMode::Enforce
+        ));
+        assert!(matches!(
+            super::effective_quarantine(&ctx.state, &[]).0,
+            QuarantineMode::Enforce
+        ));
+    }
+
+    use super::{write_index_metadata, IndexMetadata};
+    use crate::registry::{read_validators, write_validators, Validators};
     use crate::test_helpers::{
         body_bytes, create_test_context_with_config, send, send_with_headers,
     };
@@ -1743,7 +2292,12 @@ mod integration_tests {
         let index = "---\nrails 1.0.0,99.0.0 abc123\n";
         Mock::given(method("GET"))
             .and(path("/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(index)
+                    .insert_header("etag", "\"versions-v1\"")
+                    .insert_header("last-modified", "Wed, 28 Oct 2026 19:58:10 GMT"),
+            )
             .expect(1)
             .mount(&upstream)
             .await;
@@ -1758,6 +2312,236 @@ mod integration_tests {
             "text/plain; charset=utf-8"
         );
         assert_eq!(body_bytes(resp).await.as_ref(), index.as_bytes());
+        let validators = read_validators(&ctx.state.storage, "gems/versions")
+            .await
+            .unwrap();
+        assert_eq!(validators.etag.as_deref(), Some("\"versions-v1\""));
+        assert_eq!(
+            validators.last_modified.as_deref(),
+            Some("Wed, 28 Oct 2026 19:58:10 GMT")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gems_versions_revalidates_with_etag_and_last_modified() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (etag, last_modified) in [(true, false), (false, true), (true, true)] {
+            let upstream = MockServer::start().await;
+            let mut mock = Mock::given(method("GET")).and(path("/versions"));
+            if etag {
+                mock = mock.and(header("if-none-match", "\"v1\""));
+            }
+            if last_modified {
+                mock = mock.and(|request: &wiremock::Request| {
+                    request
+                        .headers
+                        .get("if-modified-since")
+                        .is_some_and(|value| value == "Wed, 28 Oct 2026 19:58:10 GMT")
+                });
+            }
+            mock.respond_with(ResponseTemplate::new(304))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(upstream.uri());
+                cfg.gems.metadata_ttl = 0;
+                cfg.gems.serve_stale = false;
+            });
+            let index = b"---\nrails 1.0.0 abc123\n";
+            ctx.state.storage.put("gems/versions", index).await.unwrap();
+            write_index_metadata(
+                &ctx.state.storage,
+                "gems/versions",
+                &IndexMetadata {
+                    validators: Validators {
+                        etag: etag.then(|| "\"v1\"".to_string()),
+                        last_modified: last_modified
+                            .then(|| "Wed, 28 Oct 2026 19:58:10 GMT".to_string()),
+                    },
+                    cache_control: Some("max-age=60, public".to_string()),
+                },
+            )
+            .await;
+            let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                "max-age=60, public, stale-while-revalidate=259200, stale-if-error=432000"
+            );
+            assert_eq!(body_bytes(resp).await.as_ref(), index);
+            upstream.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gems_versions_changed_body_replaces_old_validators() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/versions"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(200).set_body_string("new index"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.metadata_ttl = 0;
+            cfg.gems.serve_stale = false;
+        });
+        ctx.state
+            .storage
+            .put("gems/versions", b"old index")
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            "gems/versions",
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        let resp = send(&ctx.app, Method::GET, "/gems/versions", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key(header::CACHE_CONTROL));
+        assert_eq!(body_bytes(resp).await.as_ref(), b"new index");
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("gems/versions")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"new index"
+        );
+        assert_eq!(
+            read_validators(&ctx.state.storage, "gems/versions")
+                .await
+                .unwrap(),
+            Validators::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gems_index_preserves_upstream_cache_control_on_fetch_and_cache_hit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for resource in ["versions", "info/rails"] {
+            let upstream = MockServer::start().await;
+            let policy = "public, max-age=42, stale-while-revalidate=10";
+            Mock::given(method("GET"))
+                .and(path(format!("/{resource}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string("index")
+                        .insert_header("cache-control", policy)
+                        .insert_header("etag", "\"v1\""),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(upstream.uri());
+            });
+            let route = format!("/gems/{resource}");
+            let key = format!("gems/{resource}");
+            let resp = send(&ctx.app, Method::GET, &route, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                if resource == "versions" {
+                    "public, max-age=42, stale-while-revalidate=259200, stale-if-error=432000"
+                } else {
+                    "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
+                }
+            );
+            assert_eq!(body_bytes(resp).await.as_ref(), b"index");
+            // /info/ persists its body and metadata in a background task.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if super::read_index_metadata(&ctx.state, &key)
+                        .await
+                        .cache_control
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let resp = send(&ctx.app, Method::GET, &route, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                if resource == "versions" {
+                    "public, max-age=42, stale-while-revalidate=259200, stale-if-error=432000"
+                } else {
+                    "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
+                }
+            );
+            assert_eq!(body_bytes(resp).await.as_ref(), b"index");
+            upstream.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gems_index_304_updates_upstream_cache_control() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for resource in ["versions", "info/rails"] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/{resource}")))
+                .and(header("if-none-match", "\"v1\""))
+                .respond_with(
+                    ResponseTemplate::new(304).insert_header("cache-control", "max-age=90, public"),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(upstream.uri());
+                cfg.gems.metadata_ttl = 0;
+                cfg.gems.serve_stale = false;
+            });
+            let key = format!("gems/{resource}");
+            ctx.state.storage.put(&key, b"index").await.unwrap();
+            write_index_metadata(
+                &ctx.state.storage,
+                &key,
+                &IndexMetadata {
+                    validators: Validators {
+                        etag: Some("\"v1\"".to_string()),
+                        last_modified: None,
+                    },
+                    cache_control: Some("max-age=60, public".to_string()),
+                },
+            )
+            .await;
+            let resp = send(&ctx.app, Method::GET, &format!("/gems/{resource}"), "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[header::CACHE_CONTROL],
+                if resource == "versions" {
+                    "max-age=90, public, stale-while-revalidate=259200, stale-if-error=432000"
+                } else {
+                    "public, max-age=86400, stale-while-revalidate=259200, stale-if-error=432000"
+                }
+            );
+            assert_eq!(body_bytes(resp).await.as_ref(), b"index");
+        }
     }
 
     #[tokio::test]
@@ -1768,6 +2552,15 @@ mod integration_tests {
         });
         let index = b"created_at: 2026-10-01T00:00:00Z\n---\nrails 1.0.0,99.0.0 abc123\n";
         ctx.state.storage.put("gems/versions", index).await.unwrap();
+        write_index_metadata(
+            &ctx.state.storage,
+            "gems/versions",
+            &IndexMetadata {
+                validators: Validators::default(),
+                cache_control: Some("max-age=60, public".to_string()),
+            },
+        )
+        .await;
         // A full 200 response is valid for a Range request too; do not relay
         // upstream partial bodies or validators for a different representation.
         let resp = send_with_headers(
@@ -1785,7 +2578,7 @@ mod integration_tests {
         );
         assert_eq!(
             resp.headers()[header::CACHE_CONTROL],
-            "public, max-age=3600, must-revalidate"
+            "max-age=60, public, stale-while-revalidate=259200, stale-if-error=432000"
         );
         assert_eq!(body_bytes(resp).await.as_ref(), index);
     }
@@ -2129,7 +2922,7 @@ mod platform_gem_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gem_file_names_per_rubygems {
-    use super::{compact_index_lists, gem_file_readings, GemFile};
+    use super::{compact_index_lists_text as compact_index_lists, gem_file_readings, GemFile};
     use proptest::prelude::*;
 
     fn file(name: &str, version: &str, platform: Option<&str>) -> GemFile {
@@ -2617,7 +3410,7 @@ mod gem_file_identity_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gem_file_every_reading_counts {
-    use super::{compact_index_lists, GemFile};
+    use super::{compact_index_lists_text as compact_index_lists, GemFile};
     use crate::test_helpers::{create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::any;
@@ -3351,5 +4144,205 @@ mod gem_file_name_work {
                 "{} reads as {:?}", stem, readings
             );
         }
+    }
+}
+
+#[cfg(test)]
+fn compact_index_lists_text(index: &str, file: &GemFile) -> bool {
+    compact_index_lists(&super::gems_cache::version_tokens(index), file)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod exact_version_cooldown_tests {
+    use crate::test_helpers::{create_test_context_with_config, quarantine_7d, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_other_policy() {
+        for (name, version, blocked) in [
+            ("example", "1.0.0", false),
+            ("example", "1.0.1", false),
+            ("other", "1.0.0", false),
+            ("example", "1.0.0", true),
+        ] {
+            let up = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GEM".to_vec()))
+                .mount(&up)
+                .await;
+            let (_dir, blocklist) = crate::test_helpers::blocklist_file("gems", "example");
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.gems.enabled = true;
+                cfg.gems.proxy = Some(uri);
+                quarantine_7d(cfg);
+                cfg.curation.min_release_age = Some("7d".into());
+                cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                    serde_json::json!({"name":"example","version":"1.0.0"}),
+                )
+                .unwrap()];
+                if blocked {
+                    cfg.curation.blocklist_path = Some(blocklist);
+                }
+            });
+            let expected = if name == "example" && version == "1.0.0" && !blocked {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            for platform in ["", "-x86_64-linux", "-arm64-darwin"] {
+                for uri in [
+                    format!("/gems/gems/{name}-{version}{platform}.gem"),
+                    format!("/gems/quick/Marshal.4.8/{name}-{version}{platform}.gemspec.rz"),
+                ] {
+                    let holders = ctx.state.storage.holders();
+                    assert_eq!(
+                        send(&ctx.app, Method::GET, &uri, "").await.status(),
+                        expected,
+                        "{uri}"
+                    );
+                    crate::test_helpers::background_writes_done(&ctx.state.storage, holders).await;
+                    if expected == StatusCode::OK {
+                        assert!(ctx
+                            .state
+                            .storage
+                            .stat(uri.trim_start_matches('/'))
+                            .await
+                            .is_some());
+                    }
+                    assert_eq!(
+                        send(&ctx.app, Method::GET, &uri, "").await.status(),
+                        expected,
+                        "{uri}"
+                    );
+                }
+            }
+            let uri = format!("/gems/gems/{name}-{version}.gem");
+            if expected == StatusCode::OK {
+                crate::test_helpers::reload_curation(&ctx, |cfg| {
+                    cfg.curation.gems.cooldown_exempt_versions.clear()
+                });
+                assert_eq!(
+                    send(&ctx.app, Method::GET, &uri, "").await.status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn exact_version_exemption_requires_every_ambiguous_identity() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GEM".to_vec()))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let identities = super::gem_file_readings("evil-1-2.0-java");
+        assert!(identities.len() > 1);
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(uri);
+            quarantine_7d(cfg);
+            cfg.curation.min_release_age = Some("7d".into());
+        });
+        for count in [1, identities.len()] {
+            crate::test_helpers::reload_curation(&ctx, |cfg| {
+                cfg.curation.gems.cooldown_exempt_versions = identities
+                    .iter()
+                    .take(count)
+                    .map(|identity| {
+                        serde_json::from_value(
+                            serde_json::json!({"name":identity.name,"version":identity.version}),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+            });
+            let expected = if count == 1 {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            };
+            for uri in [
+                "/gems/gems/evil-1-2.0-java.gem",
+                "/gems/quick/Marshal.4.8/evil-1-2.0-java.gemspec.rz",
+            ] {
+                assert_eq!(
+                    send(&ctx.app, Method::GET, uri, "").await.status(),
+                    expected,
+                    "{uri}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_version_exemption_preserves_cached_gem_integrity_even_for_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, serde_json::json!({"version":1,"entries":[{"registry":"gems","name":"example","version":"1.0.0","integrity":format!("sha256:{}", "0".repeat(64))}]}).to_string()).unwrap();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            quarantine_7d(cfg);
+            cfg.curation.min_release_age = Some("7d".into());
+            cfg.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
+            cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"example","version":"1.0.0"}),
+            )
+            .unwrap()];
+        });
+        {
+            let key = "gems/gems/example-1.0.0.gem";
+            let uri = "/gems/gems/example-1.0.0.gem";
+            ctx.state.storage.put(key, b"GEM").await.unwrap();
+            assert_eq!(
+                send(&ctx.app, Method::GET, uri, "").await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                crate::test_helpers::send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    uri,
+                    vec![("range", "bytes=0-1")],
+                    ""
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    #[tokio::test]
+    async fn exact_version_exemption_does_not_serve_corrupted_cached_gemspec() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+            quarantine_7d(cfg);
+            cfg.curation.gems.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"example","version":"1.0.0"}),
+            )
+            .unwrap()];
+        });
+        let key = "gems/quick/Marshal.4.8/example-1.0.0.gemspec.rz";
+        let uri = "/gems/quick/Marshal.4.8/example-1.0.0.gemspec.rz";
+        ctx.state.storage.put(key, b"SPEC").await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, uri, "").await.status(),
+            StatusCode::OK
+        );
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(key),
+            b"CORRUPTED",
+        )
+        .unwrap();
+        assert!(!send(&ctx.app, Method::GET, uri, "")
+            .await
+            .status()
+            .is_success());
     }
 }

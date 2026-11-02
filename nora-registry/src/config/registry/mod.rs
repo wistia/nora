@@ -175,3 +175,6 @@ pub use self::pypi::PypiConfig;
 pub use self::raw::RawConfig;
 pub use self::rpm::RpmConfig;
 pub use self::terraform::TerraformConfig;
+
+mod hex;
+pub use self::hex::HexConfig;

@@ -1,0 +1,4 @@
+app/deps/
+app/_build/
+.state/
+__pycache__/
