@@ -299,14 +299,40 @@ async fn cached_central_date(
     state: &AppState,
     path: &str,
     bytes: &[u8],
-) -> Option<CentralArtifactDate> {
-    let bytes_record = state.storage.get(&date_key(path, bytes)).await.ok()?;
-    let record: CentralArtifactDate = serde_json::from_slice(&bytes_record).ok()?;
-    valid_date_record(&record, path, bytes).then_some(record)
+) -> Result<Option<CentralArtifactDate>, DateLookupUnavailable> {
+    let bytes_record = match state.storage.get(&date_key(path, bytes)).await {
+        Ok(data) => data,
+        Err(crate::storage::StorageError::NotFound) => return Ok(None),
+        Err(_) => return Err(DateLookupUnavailable),
+    };
+    let record: CentralArtifactDate =
+        serde_json::from_slice(&bytes_record).map_err(|_| DateLookupUnavailable)?;
+    if !valid_date_record(&record, path, bytes) {
+        return Err(DateLookupUnavailable);
+    }
+    Ok(Some(record))
 }
 
 #[derive(Debug)]
 struct DateLookupUnavailable;
+
+fn requires_maven_date(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    cooldown_exempt: bool,
+    q_mode: &crate::digest_quarantine::QuarantineMode,
+) -> bool {
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    !cooldown_exempt
+        && (matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+            || (matches!(engine.mode(), crate::config::CurationMode::Enforce)
+                && engine.reads_release_date(RegistryType::Maven)
+                && !crate::curation::has_valid_bypass_token(
+                    state.bypass_token().as_deref(),
+                    headers,
+                )))
+}
 
 fn date_lookup_unavailable_response() -> Response {
     (
@@ -408,7 +434,7 @@ async fn record_central_date(
     let key = date_key(path, bytes);
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
-    if let Some(record) = cached_central_date(state, path, bytes).await {
+    if let Some(record) = cached_central_date(state, path, bytes).await? {
         return Ok(Some(record));
     }
     let header_date = headers
@@ -479,7 +505,10 @@ async fn record_central_date(
         .create_internal(&key, &data)
         .await
         .map_err(|_| DateLookupUnavailable)?;
-    Ok(cached_central_date(state, path, bytes).await)
+    cached_central_date(state, path, bytes)
+        .await?
+        .map(Some)
+        .ok_or(DateLookupUnavailable)
 }
 
 // ============================================================================
@@ -534,25 +563,6 @@ async fn download(
         })
         .unwrap_or(false);
 
-    let cached_meta = state.storage.stat(&key).await;
-    let (cached, read_failure) = crate::registry::cached_read(state.storage.get(&key).await);
-    // Warm downloads read only shared, digest-bound evidence. Unknown dates stay
-    // unknown; do not ask a search service about cached/private artifacts.
-    let trusted_date =
-        if !internal && state.config.server.trust_upstream_dates && !is_mutable_maven_path(&path) {
-            match cached.as_ref() {
-                Some(bytes) => cached_central_date(&state, &path, bytes).await,
-                None => None,
-            }
-        } else {
-            None
-        };
-    let publish_date = if state.config.maven.proxies.is_empty() {
-        crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
-    } else {
-        trusted_date.as_ref().map(|r| r.timestamp)
-    };
-
     let cooldown_exempt = curation_coords.as_ref().is_some_and(|(name, version)| {
         state.curation().curation_engine.cooldown_exempt_version(
             crate::curation::RegistryType::Maven,
@@ -560,6 +570,53 @@ async fn download(
             Some(version),
         )
     });
+
+    // Resolved here, not at the serve site, so the range branch below can see it.
+    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.maven.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .maven
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+    let date_required = requires_maven_date(&state, &headers, cooldown_exempt, &q_mode);
+    let reads_evidence = !internal
+        && !cooldown_exempt
+        && state.config.server.trust_upstream_dates
+        && !is_mutable_maven_path(&path)
+        && (state
+            .curation()
+            .curation_engine
+            .reads_release_date(RegistryType::Maven)
+            || !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off));
+    let cached_meta = state.storage.stat(&key).await;
+    let early_read = if reads_evidence {
+        Some(crate::registry::cached_read(state.storage.get(&key).await))
+    } else {
+        None
+    };
+    // Warm downloads read only shared, digest-bound evidence. Unknown dates stay
+    // unknown; do not ask a search service about cached/private artifacts.
+    let trusted_date = match early_read.as_ref().and_then(|(cached, _)| cached.as_ref()) {
+        Some(bytes) => match cached_central_date(&state, &path, bytes).await {
+            Ok(record) => record,
+            Err(_) if date_required => return date_lookup_unavailable_response(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let publish_date = if state.config.maven.proxies.is_empty() {
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
+    } else {
+        trusted_date.as_ref().map(|r| r.timestamp)
+    };
 
     // Curation check — only for versioned artifact files, not metadata
     if let Some((ref maven_name, ref maven_version)) = curation_coords {
@@ -577,22 +634,6 @@ async fn download(
             }
         }
     }
-
-    // Resolved here, not at the serve site, so the range branch below can see it.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-        state.config.curation.maven.quarantine.as_ref().or(state
-            .config
-            .curation
-            .quarantine
-            .as_ref()),
-        state
-            .config
-            .curation
-            .maven
-            .quarantine_ttl
-            .as_deref()
-            .or(state.config.curation.quarantine_ttl.as_deref()),
-    );
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. Release artifacts only — maven-metadata.xml and SNAPSHOT
@@ -613,6 +654,7 @@ async fn download(
     if !is_mutable_maven_path(&path)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
         && !integrity_applies
+        && !reads_evidence
     {
         if let Some(meta) = cached_meta.as_ref() {
             if let Some(response) = crate::registry::range::range_response(
@@ -636,6 +678,11 @@ async fn download(
             }
         }
     }
+
+    let (cached, read_failure) = match early_read {
+        Some(result) => result,
+        None => crate::registry::cached_read(state.storage.get(&key).await),
+    };
 
     // maven-metadata.xml and SNAPSHOT artifacts are MUTABLE (rewritten as versions deploy); a
     // proxied mutable path must be revalidated against upstream unless within a positive
@@ -835,16 +882,7 @@ async fn download(
                                 .await
                                 {
                                     Ok(record) => record,
-                                    Err(_)
-                                        if !cooldown_exempt
-                                            && (matches!(
-                                                q_mode,
-                                                crate::digest_quarantine::QuarantineMode::Enforce
-                                            ) || matches!(
-                                                state.config.curation.mode,
-                                                crate::config::CurationMode::Enforce
-                                            )) =>
-                                    {
+                                    Err(_) if date_required => {
                                         return date_lookup_unavailable_response()
                                     }
                                     Err(_) => None,
@@ -3526,6 +3564,377 @@ mod central_date_evidence_tests {
     use super::*;
     use crate::test_helpers::create_test_context_with_storage_and_config;
 
+    use crate::storage::{FileMeta, ObjectStorage, StorageBackend};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct EvidenceTestStore {
+        inner: ObjectStorage,
+        fail_dates: AtomicBool,
+        fail_readback: AtomicBool,
+        full_reads: AtomicUsize,
+        range_reads: AtomicUsize,
+    }
+    impl EvidenceTestStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: ObjectStorage::in_memory(),
+                fail_dates: AtomicBool::new(false),
+                fail_readback: AtomicBool::new(false),
+                full_reads: AtomicUsize::new(0),
+                range_reads: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for EvidenceTestStore {
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            if k.starts_with("maven/") {
+                self.full_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            if k.starts_with(".nora-maven-dates/") && self.fail_dates.load(Ordering::SeqCst) {
+                return Err(crate::storage::StorageError::Network(
+                    "date read failed".into(),
+                ));
+            }
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha256).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn list_with_meta(&self, p: &str) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+            self.inner.list_with_meta(p).await
+        }
+        async fn stat(&self, k: &str) -> Option<FileMeta> {
+            self.inner.stat(k).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "second-read-fails-test-store"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(k, src, sha256).await
+        }
+        async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+            self.inner.copy(s, d, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+        async fn create(&self, key: &str, data: &[u8], pin: &str) -> crate::storage::Result<bool> {
+            let created = self.inner.create(key, data, pin).await?;
+            if key.starts_with(".nora-maven-dates/") && self.fail_readback.load(Ordering::SeqCst) {
+                self.fail_dates.store(true, Ordering::SeqCst);
+            }
+            Ok(created)
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            start: u64,
+            end: u64,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.range_reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_range(key, start, end).await
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_requirement_tracks_age_policy_bypass_and_quarantine() {
+        use crate::digest_quarantine::QuarantineMode;
+        let empty = axum::http::HeaderMap::new();
+        let blocklist =
+            create_test_context_with_storage_and_config(crate::Storage::in_memory(), |cfg| {
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.min_release_age = None;
+                cfg.curation.maven.min_release_age = None;
+            });
+        assert!(!requires_maven_date(
+            &blocklist.state,
+            &empty,
+            false,
+            &QuarantineMode::Off
+        ));
+        let age = create_test_context_with_storage_and_config(crate::Storage::in_memory(), |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.maven.min_release_age = Some("7d".into());
+            cfg.curation.bypass_token = Some("secret".into());
+        });
+        assert!(requires_maven_date(
+            &age.state,
+            &empty,
+            false,
+            &QuarantineMode::Off
+        ));
+        let mut headers = empty;
+        headers.insert("x-nora-bypass-token", HeaderValue::from_static("secret"));
+        assert!(!requires_maven_date(
+            &age.state,
+            &headers,
+            false,
+            &QuarantineMode::Off
+        ));
+        assert!(requires_maven_date(
+            &age.state,
+            &headers,
+            false,
+            &QuarantineMode::Enforce
+        ));
+        assert!(!requires_maven_date(
+            &age.state,
+            &headers,
+            true,
+            &QuarantineMode::Enforce
+        ));
+        headers.insert("x-nora-bypass-token", HeaderValue::from_static("wrong"));
+        assert!(requires_maven_date(
+            &age.state,
+            &headers,
+            false,
+            &QuarantineMode::Off
+        ));
+    }
+
+    #[tokio::test]
+    async fn evidence_read_failure_and_corruption_are_retryable_not_cooldown_denials() {
+        use crate::digest_quarantine::{
+            proxy_gate_shared_recoverable, QuarantineMode, TrustedReleaseEvidence,
+        };
+        use crate::test_helpers::send;
+        use axum::http::Method;
+        let backend = EvidenceTestStore::new();
+        let storage = crate::Storage::from_backend(backend.clone());
+        let ctx = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.maven.proxies =
+                serde_json::from_value(serde_json::json!(["https://repo.maven.apache.org/maven2"]))
+                    .unwrap();
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".into());
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+        });
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        let bytes = b"old artifact";
+        let source =
+            reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        let record = record_central_date(
+            &ctx.state,
+            path,
+            bytes,
+            &source,
+            &headers,
+            "org.example:demo",
+            "1.0",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let evidence =
+            TrustedReleaseEvidence::maven_central(record.timestamp, source.as_str(), bytes)
+                .unwrap();
+        assert!(proxy_gate_shared_recoverable(
+            &storage,
+            &ctx.state.digest_store,
+            "maven",
+            bytes,
+            &QuarantineMode::Enforce,
+            604800,
+            source.as_str(),
+            true,
+            Some(&evidence)
+        )
+        .await
+        .is_none());
+        storage.put(&storage_key(path), bytes).await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        backend.fail_dates.store(true, Ordering::SeqCst);
+        let response = send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        backend.fail_dates.store(false, Ordering::SeqCst);
+        assert_eq!(
+            send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        for bad in [
+            b"invalid json".to_vec(),
+            serde_json::to_vec(&CentralArtifactDate {
+                source: source.to_string(),
+                digest: "incorrect digest".into(),
+                timestamp: record.timestamp,
+                kind: CentralDateKind::LastModified,
+            })
+            .unwrap(),
+        ] {
+            storage.put(&date_key(path, bytes), &bad).await.unwrap();
+            assert_eq!(
+                send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "")
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_date_does_not_block_blocklist_only_or_bypassed_requests() {
+        use crate::test_helpers::{send, send_with_headers};
+        use axum::http::Method;
+        let backend = EvidenceTestStore::new();
+        let storage = crate::Storage::from_backend(backend.clone());
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        storage
+            .put(&storage_key(path), b"old artifact")
+            .await
+            .unwrap();
+        backend.fail_dates.store(true, Ordering::SeqCst);
+        for age_policy in [false, true] {
+            let ctx = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+                cfg.maven.proxies = serde_json::from_value(serde_json::json!([
+                    "https://repo.maven.apache.org/maven2"
+                ]))
+                .unwrap();
+                cfg.server.trust_upstream_dates = true;
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.min_release_age = if age_policy { Some("7d".into()) } else { None };
+                cfg.curation.maven.min_release_age = None;
+                cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Off);
+                cfg.curation.bypass_token = Some("secret".into());
+            });
+            let uri = format!("/maven2/{path}");
+            let response = send(&ctx.app, Method::GET, &uri, "").await;
+            assert_eq!(
+                response.status(),
+                if age_policy {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                &uri,
+                vec![("x-nora-bypass-token", "secret")],
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_evidence_readback_failure_returns_unavailable_without_seeding_hold() {
+        let backend = EvidenceTestStore::new();
+        let storage = crate::Storage::from_backend(backend.clone());
+        let ctx = create_test_context_with_storage_and_config(storage.clone(), |_| {});
+        let path = "org/example/demo/1.0/demo-1.0.pom";
+        let source =
+            reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        backend.fail_readback.store(true, Ordering::SeqCst);
+        assert!(record_central_date(
+            &ctx.state,
+            path,
+            b"pom",
+            &source,
+            &headers,
+            "org.example:demo",
+            "1.0"
+        )
+        .await
+        .is_err());
+        assert!(storage
+            .list_internal(".nora-quarantine/maven/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn range_fast_path_does_not_read_the_entire_artifact() {
+        use crate::test_helpers::{body_bytes, send_with_headers};
+        use axum::http::Method;
+        let backend = EvidenceTestStore::new();
+        let storage = crate::Storage::from_backend(backend.clone());
+        let ctx = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.mode = crate::config::CurationMode::Off;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Off);
+        });
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        storage
+            .put(&storage_key(path), b"0123456789")
+            .await
+            .unwrap();
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &format!("/maven2/{path}"),
+            vec![("range", "bytes=2-4")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(response).await.as_ref(), b"234");
+        assert_eq!(backend.full_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.range_reads.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn lookup_failures_are_retryable_but_empty_results_are_unknown() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3708,14 +4117,19 @@ mod central_date_evidence_tests {
         .unwrap()
         .unwrap();
         assert_eq!(record.timestamp, 1699483767);
-        let cached = cached_central_date(&b.state, path, bytes).await.unwrap();
+        let cached = cached_central_date(&b.state, path, bytes)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.timestamp, record.timestamp);
         assert!(cached_central_date(&b.state, path, b"different artifact")
             .await
+            .unwrap()
             .is_none());
         assert!(
             cached_central_date(&b.state, "org/other/demo/1.0/demo-1.0.jar", bytes)
                 .await
+                .unwrap()
                 .is_none()
         );
         assert!(!valid_date_record(&record, path, b"different artifact"));
