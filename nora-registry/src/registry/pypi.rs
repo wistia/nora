@@ -442,7 +442,12 @@ async fn download_file(
 
     // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
     // Docker-only wiring). Resolved once; applied at each serve point below.
-    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+    let cooldown_exempt = state.curation().curation_engine.cooldown_exempt_version(
+        crate::curation::RegistryType::PyPI,
+        &normalized,
+        version.as_deref(),
+    );
+    let (mut q_mode, q_secs) = crate::digest_quarantine::resolve_global(
         state.config.curation.pypi.quarantine.as_ref().or(state
             .config
             .curation
@@ -456,6 +461,10 @@ async fn download_file(
             .as_deref()
             .or(state.config.curation.quarantine_ttl.as_deref()),
     );
+
+    if cooldown_exempt {
+        q_mode = crate::digest_quarantine::QuarantineMode::Off;
+    }
 
     // Resumable download (#657): serve the requested bytes from the backend and skip
     // the full read below. Package files only — the simple index is generated, never
@@ -2410,6 +2419,51 @@ mod integration_tests {
         let second = context();
         assert_eq!(
             send(&second.app, Method::GET, path, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_pypi_exemption_skips_only_matching_version() {
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        let storage = crate::Storage::in_memory();
+        for version in ["1.0", "2.0"] {
+            storage
+                .put(&format!("pypi/demo/demo-{version}.tar.gz"), b"artifact")
+                .await
+                .unwrap();
+        }
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.pypi.proxy = None;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+            cfg.curation.pypi.cooldown_exempt_versions =
+                vec![
+                    serde_json::from_value(serde_json::json!({"name":"Demo", "version":"1.0.0"}))
+                        .unwrap(),
+                ];
+        });
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/pypi/simple/demo/demo-1.0.tar.gz",
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/pypi/simple/demo/demo-2.0.tar.gz",
+                ""
+            )
+            .await
+            .status(),
             StatusCode::FORBIDDEN
         );
     }
