@@ -717,12 +717,18 @@ pub(crate) async fn proxy_gate_shared_recoverable(
         };
         let Some(saved) = saved else { return Ok(first_seen); };
         let saved: TrustedReleaseEvidence = serde_json::from_slice(&saved).map_err(|e| e.to_string())?;
-        if !saved.matches_bytes(bytes)
-            || evidence.is_none_or(|current| current.artifact_url != saved.artifact_url)
-        {
-            return Err("trusted release evidence does not match artifact bytes or source".to_owned());
+        if !saved.matches_bytes(bytes) {
+            return Err("trusted release evidence does not match artifact bytes".to_owned());
         }
-        Ok(first_seen.min(saved.published_at))
+        // The observation is digest-keyed, so identical bytes may be reached at
+        // several legitimate artifact URLs. The caller independently validates
+        // current evidence against its configured upstreams. A different source
+        // must use its own date, never the saved source's potentially revoked date.
+        let published_at = match evidence {
+            Some(current) if current.artifact_url != saved.artifact_url => current.published_at,
+            _ => saved.published_at,
+        };
+        Ok(first_seen.min(published_at))
     }.await;
     let first_seen = match result {
         Ok(first_seen) => first_seen,
@@ -1615,6 +1621,67 @@ mod trusted_release_recovery_tests {
             evidence,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn identical_bytes_from_distinct_sources_recover_without_reusing_another_sources_date() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let old = Utc::now().timestamp() - TTL - 60;
+        let a = TrustedReleaseEvidence::maven_central(old, URL, BYTES).unwrap();
+        let b_url = "https://packages.confluent.io/maven/org/example/other/1.0/other-1.0.jar";
+        let b = TrustedReleaseEvidence::maven_proxy(
+            old,
+            b_url,
+            BYTES,
+            "https://packages.confluent.io/maven",
+        )
+        .unwrap();
+        let (first, second) = tokio::join!(
+            gate(&storage, &local, true, Some(&a)),
+            gate(&storage, &local, true, Some(&b)),
+        );
+        assert!(first.is_none());
+        assert!(second.is_none());
+        assert!(gate(&storage, &local, true, Some(&a)).await.is_none());
+        assert!(gate(&storage, &local, true, Some(&b)).await.is_none());
+
+        // Whichever URL won the immutable saved evidence must not donate its old
+        // timestamp to a newly configured URL publishing the same bytes recently.
+        let (_, evidence_key) = keys();
+        storage
+            .put(&evidence_key, &serde_json::to_vec(&a).unwrap())
+            .await
+            .unwrap();
+        let recent = TrustedReleaseEvidence::maven_proxy(
+            Utc::now().timestamp() - 60,
+            b_url,
+            BYTES,
+            "https://packages.confluent.io/maven",
+        )
+        .unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&recent))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            gate(&storage, &local, true, None).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Independent current evidence does not make damaged shared state safe.
+        storage.put(&evidence_key, b"invalid JSON").await.unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&b))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

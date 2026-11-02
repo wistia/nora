@@ -266,6 +266,50 @@ fn configured_maven_source<'a>(state: &'a AppState, source: &str, path: &str) ->
     })
 }
 
+/// A mature conservative observation needs no new date to keep serving identical
+/// cached bytes. A stricter live release-age rule still requires a repair attempt.
+async fn missing_maven_date_needs_repair(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    bytes: &[u8],
+    q_mode: &crate::digest_quarantine::QuarantineMode,
+    q_secs: i64,
+) -> bool {
+    use crate::digest_quarantine::QuarantineMode;
+    if !matches!(q_mode, QuarantineMode::Enforce) {
+        // In particular, release-age-only policies have no digest observation
+        // whose maturity could replace an upstream date lookup.
+        return true;
+    }
+    let curation = state.curation();
+    let engine = &curation.curation_engine;
+    let min_age = if matches!(engine.mode(), crate::config::CurationMode::Enforce)
+        && !crate::curation::has_valid_bypass_token(state.bypass_token().as_deref(), headers)
+    {
+        engine
+            .min_release_age_secs(RegistryType::Maven)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    // Use the canonical gate to preserve validation, local/shared behavior, and
+    // unknown-observation handling. Invalid state remains a refusal, never a
+    // reason to assume that a conservative hold has matured.
+    crate::digest_quarantine::proxy_gate_shared_recoverable(
+        &state.storage,
+        &state.digest_store,
+        "maven",
+        bytes,
+        q_mode,
+        q_secs.max(min_age),
+        "cache-date-repair",
+        false,
+        None,
+    )
+    .await
+    .is_some()
+}
+
 /// Back off re-fetching cached artifacts lacking date evidence using a shared
 /// 30-second retry timestamp, allowing newly trusted upstreams to repair a hold.
 async fn retry_missing_upstream_date(state: &AppState, path: &str, bytes: &[u8]) -> bool {
@@ -328,6 +372,16 @@ fn date_key(path: &str, bytes: &[u8]) -> String {
     )
 }
 
+/// Additional immutable evidence after an operator changes the trusted upstream
+/// list. Keep the original path/digest record intact for older replicas and audits.
+fn source_date_key(path: &str, bytes: &[u8], source: &str) -> String {
+    format!(
+        "{}.source-{}",
+        date_key(path, bytes),
+        hex::encode(sha2::Sha256::digest(source.as_bytes()))
+    )
+}
+
 fn valid_date_record(record: &MavenArtifactDate, path: &str, bytes: &[u8]) -> bool {
     reqwest::Url::parse(&record.source).is_ok_and(|u| u.path().ends_with(&format!("/{path}")))
         && (matches!(record.kind, MavenDateKind::LastModified)
@@ -343,18 +397,48 @@ async fn cached_maven_date(
     bytes: &[u8],
 ) -> Result<Option<MavenArtifactDate>, DateLookupUnavailable> {
     let bytes_record = match state.storage.get(&date_key(path, bytes)).await {
-        Ok(data) => data,
-        Err(crate::storage::StorageError::NotFound) => return Ok(None),
+        Ok(data) => Some(data),
+        Err(crate::storage::StorageError::NotFound) => None,
         Err(_) => return Err(DateLookupUnavailable),
     };
-    let record: MavenArtifactDate =
-        serde_json::from_slice(&bytes_record).map_err(|_| DateLookupUnavailable)?;
-    if !valid_date_record(&record, path, bytes)
-        || configured_maven_source(state, &record.source, path).is_none()
-    {
-        return Err(DateLookupUnavailable);
+    if let Some(bytes_record) = bytes_record {
+        let record: MavenArtifactDate =
+            serde_json::from_slice(&bytes_record).map_err(|_| DateLookupUnavailable)?;
+        if !valid_date_record(&record, path, bytes) {
+            return Err(DateLookupUnavailable);
+        }
+        if configured_maven_source(state, &record.source, path).is_some() {
+            return Ok(Some(record));
+        }
+        // A valid record from a removed upstream is stale, not corrupt. Ignore
+        // its date and let a currently configured source establish fresh evidence.
     }
-    Ok(Some(record))
+    for proxy in &state.config.maven.proxies {
+        let Ok(source) =
+            reqwest::Url::parse(&format!("{}/{}", proxy.url().trim_end_matches('/'), path))
+        else {
+            continue;
+        };
+        if configured_maven_source(state, source.as_str(), path).is_none() {
+            continue;
+        }
+        let data = match state
+            .storage
+            .get(&source_date_key(path, bytes, source.as_str()))
+            .await
+        {
+            Ok(data) => data,
+            Err(crate::storage::StorageError::NotFound) => continue,
+            Err(_) => return Err(DateLookupUnavailable),
+        };
+        let record: MavenArtifactDate =
+            serde_json::from_slice(&data).map_err(|_| DateLookupUnavailable)?;
+        if !valid_date_record(&record, path, bytes) || record.source != source.as_str() {
+            return Err(DateLookupUnavailable);
+        }
+        return Ok(Some(record));
+    }
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -563,6 +647,14 @@ async fn record_maven_date(
         return Ok(None);
     }
     let data = serde_json::to_vec(&record).map_err(|_| DateLookupUnavailable)?;
+    // Publish source-scoped evidence before the legacy compatibility record.
+    // Concurrent replicas configured with different upstreams can then each
+    // read their own winner without overwriting or trusting a revoked source.
+    state
+        .storage
+        .create_internal(&source_date_key(path, bytes, source.as_str()), &data)
+        .await
+        .map_err(|_| DateLookupUnavailable)?;
     state
         .storage
         .create_internal(&key, &data)
@@ -757,16 +849,13 @@ async fn download(
     // Release artifacts are immutable and served from cache; a hosted artifact is authoritative.
     let repair_missing_date = if let Some(bytes) = cached.as_ref() {
         trusted_date.is_none()
+            && curation_coords.is_some()
             && date_required
             && state.config.server.trust_upstream_dates
             && !internal
             && !is_mutable_maven_path(&path)
-            && state
-                .config
-                .maven
-                .proxies
-                .iter()
-                .any(|p| !url_is_maven_central(p.url()))
+            && !state.config.maven.proxies.is_empty()
+            && missing_maven_date_needs_repair(&state, &headers, bytes, &q_mode, q_secs).await
             && retry_missing_upstream_date(&state, &path, bytes).await
     } else {
         false
@@ -4593,6 +4682,169 @@ mod central_date_evidence_tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_sources_publish_independent_date_evidence_for_the_same_path_and_bytes() {
+        let storage = crate::Storage::in_memory();
+        let source_a = "https://repo1.maven.org/maven2";
+        let source_b = "https://packages.confluent.io/maven";
+        let a = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.maven.proxies = serde_json::from_value(serde_json::json!([source_a])).unwrap();
+        });
+        let b = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.maven.proxies = serde_json::from_value(serde_json::json!([source_b])).unwrap();
+        });
+        let path = "org/example/demo/1.0/demo-1.0.pom";
+        let bytes = b"identical artifact bytes";
+        let a_url = reqwest::Url::parse(&format!("{source_a}/{path}")).unwrap();
+        let b_url = reqwest::Url::parse(&format!("{source_b}/{path}")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        let (a_record, b_record) = tokio::join!(
+            record_maven_date(
+                &a.state,
+                path,
+                bytes,
+                &a_url,
+                &headers,
+                "org.example:demo",
+                "1.0"
+            ),
+            record_maven_date(
+                &b.state,
+                path,
+                bytes,
+                &b_url,
+                &headers,
+                "org.example:demo",
+                "1.0"
+            ),
+        );
+        assert_eq!(a_record.unwrap().unwrap().source, a_url.as_str());
+        assert_eq!(b_record.unwrap().unwrap().source, b_url.as_str());
+        assert_eq!(
+            cached_maven_date(&a.state, path, bytes)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            a_url.as_str()
+        );
+        assert_eq!(
+            cached_maven_date(&b.state, path, bytes)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            b_url.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_a_configured_source_revalidates_without_mutating_legacy_evidence() {
+        let storage = crate::Storage::in_memory();
+        let source_a = "https://repo1.maven.org/maven2";
+        let source_b = "https://packages.confluent.io/maven";
+        let path = "org/example/demo/1.0/demo-1.0.pom";
+        let bytes = b"the same immutable artifact";
+        let a = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.maven.proxies = serde_json::from_value(serde_json::json!([source_a])).unwrap();
+        });
+        let b = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+            cfg.maven.proxies = serde_json::from_value(serde_json::json!([source_b])).unwrap();
+        });
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        record_maven_date(
+            &a.state,
+            path,
+            bytes,
+            &reqwest::Url::parse(&format!("{source_a}/{path}")).unwrap(),
+            &headers,
+            "org.example:demo",
+            "1.0",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let legacy = storage.get(&date_key(path, bytes)).await.unwrap();
+        assert!(cached_maven_date(&b.state, path, bytes)
+            .await
+            .unwrap()
+            .is_none());
+        // Removing the old source cannot lend its date to the replacement when
+        // the replacement offers no usable date of its own.
+        let source_b_url = reqwest::Url::parse(&format!("{source_b}/{path}")).unwrap();
+        assert!(record_maven_date(
+            &b.state,
+            path,
+            bytes,
+            &source_b_url,
+            &reqwest::header::HeaderMap::new(),
+            "org.example:demo",
+            "1.0"
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let replacement = record_maven_date(
+            &b.state,
+            path,
+            bytes,
+            &source_b_url,
+            &headers,
+            "org.example:demo",
+            "1.0",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(replacement.source, source_b_url.as_str());
+        assert_eq!(
+            cached_maven_date(&b.state, path, bytes)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            source_b_url.as_str()
+        );
+        assert_eq!(storage.get(&date_key(path, bytes)).await.unwrap(), legacy);
+        // A replica still configured with the old source retains valid evidence.
+        assert_eq!(
+            cached_maven_date(&a.state, path, bytes)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            format!("{source_a}/{path}")
+        );
+        let scoped_key = source_date_key(path, bytes, source_b_url.as_str());
+        storage.put(&scoped_key, b"invalid JSON").await.unwrap();
+        assert!(cached_maven_date(&b.state, path, bytes).await.is_err());
+        assert!(record_maven_date(
+            &b.state,
+            path,
+            bytes,
+            &source_b_url,
+            &headers,
+            "org.example:demo",
+            "1.0"
+        )
+        .await
+        .is_err());
+        // A malformed legacy record remains an error, not a revoked-source miss.
+        storage
+            .put(&date_key(path, bytes), b"invalid JSON")
+            .await
+            .unwrap();
+        assert!(cached_maven_date(&b.state, path, bytes).await.is_err());
+    }
+
     fn proxy_test_context(
         storage: crate::Storage,
         urls: &[String],
@@ -4662,7 +4914,7 @@ mod central_date_evidence_tests {
             send(&removed.app, Method::GET, &uri, axum::body::Body::empty())
                 .await
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::FORBIDDEN
         );
     }
 
@@ -4887,6 +5139,143 @@ mod central_date_evidence_tests {
             .get(&date_key(path, b"changed artifact"))
             .await
             .is_err());
+    }
+
+    async fn seed_maven_observation(storage: &crate::Storage, bytes: &[u8], age_secs: i64) {
+        let digest = hex::encode(sha2::Sha256::digest(bytes));
+        let record = serde_json::json!({
+            "registry": "maven",
+            "digest": format!("sha256:{digest}"),
+            "first_seen": chrono::Utc::now().timestamp() - age_secs,
+            "upstream": "https://old.example/maven",
+            "timestamp_origin": "fallback_observation"
+        });
+        storage
+            .create_internal(
+                &format!(".nora-quarantine/maven/{digest}.json"),
+                &serde_json::to_vec(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mature_dateless_cache_does_not_refetch_changed_upstream_bytes() {
+        use crate::test_helpers::send;
+        use axum::http::Method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("changed upstream bytes")
+                    .insert_header("last-modified", "Tue, 09 Apr 2024 18:17:33 GMT"),
+            )
+            .mount(&upstream)
+            .await;
+        let storage = crate::Storage::in_memory();
+        let path = "io/confluent/demo/1.0/demo-1.0.pom";
+        let bytes = b"original immutable bytes";
+        storage.put(&storage_key(path), bytes).await.unwrap();
+        seed_maven_observation(&storage, bytes, 8 * 86400).await;
+        let ctx = proxy_test_context(storage, &[format!("{}/maven", upstream.uri())], true);
+        for _ in 0..2 {
+            let response = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/maven2/{path}"),
+                axum::body::Body::empty(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mature_quarantine_still_repairs_for_stricter_registry_release_age() {
+        use crate::test_helpers::send;
+        use axum::http::Method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        let recent = chrono::Utc::now().to_rfc2822();
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("artifact")
+                    .insert_header("last-modified", recent.as_str()),
+            )
+            .mount(&upstream)
+            .await;
+        let storage = crate::Storage::in_memory();
+        let path = "io/confluent/demo/1.0/demo-1.0.pom";
+        storage.put(&storage_key(path), b"artifact").await.unwrap();
+        seed_maven_observation(&storage, b"artifact", 2 * 86400).await;
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.maven.proxies =
+                serde_json::from_value(serde_json::json!([format!("{}/maven", upstream.uri())]))
+                    .unwrap();
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("1d".into());
+            cfg.curation.maven.min_release_age = Some("7d".into());
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("1d".into());
+        });
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/maven2/{path}"),
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn release_age_only_policy_still_repairs_a_dateless_cache() {
+        use crate::test_helpers::send;
+        use axum::http::Method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        let recent = chrono::Utc::now().to_rfc2822();
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("artifact")
+                    .insert_header("last-modified", recent.as_str()),
+            )
+            .mount(&upstream)
+            .await;
+        let storage = crate::Storage::in_memory();
+        let path = "io/confluent/demo/1.0/demo-1.0.pom";
+        storage.put(&storage_key(path), b"artifact").await.unwrap();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.maven.proxies =
+                serde_json::from_value(serde_json::json!([format!("{}/maven", upstream.uri())]))
+                    .unwrap();
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".into());
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Off);
+        });
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/maven2/{path}"),
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
