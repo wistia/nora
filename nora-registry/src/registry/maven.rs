@@ -3545,6 +3545,51 @@ mod central_date_evidence_tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn warm_download_uses_cached_evidence_without_egress() {
+        use crate::test_helpers::{create_test_context_with_egress_proxy, send, EgressRecorder};
+        use axum::http::Method;
+        let egress = EgressRecorder::start().await;
+        let ctx = create_test_context_with_egress_proxy(&egress.url, |cfg| {
+            cfg.maven.proxies =
+                serde_json::from_value(serde_json::json!(["https://repo.maven.apache.org/maven2"]))
+                    .unwrap();
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".into());
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+        });
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        let bytes = b"artifact";
+        let source =
+            reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        record_central_date(
+            &ctx.state,
+            path,
+            bytes,
+            &source,
+            &headers,
+            "org.example:demo",
+            "1.0",
+        )
+        .await
+        .unwrap();
+        ctx.state
+            .storage
+            .put(&storage_key(path), bytes)
+            .await
+            .unwrap();
+        let response = send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(egress.seen().await.is_empty());
+    }
+
     #[test]
     fn search_fallback_must_match_every_coordinate() {
         let json = serde_json::json!({"response":{"docs":[{"g":"org.example","a":"demo","v":"1.0","timestamp":1699483767000i64}]}});
