@@ -2451,6 +2451,50 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn trusted_old_date_seeds_shared_quarantine_across_replicas() {
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        let storage = crate::Storage::in_memory();
+        storage
+            .put("pypi/demo/demo-1.0.tar.gz", b"old artifact")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "pypi/demo/dates.json",
+                br#"{"demo-1.0.tar.gz":"2020-01-01T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        let context = || {
+            create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+                cfg.server.trust_upstream_dates = true;
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("7d".into());
+            })
+        };
+        let a = context();
+        let b = context();
+        let path = "/pypi/simple/demo/demo-1.0.tar.gz";
+        assert_eq!(
+            send(&a.app, Method::GET, path, "").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&b.app, Method::GET, path, "").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            storage
+                .list_internal(".nora-quarantine/pypi/")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn corrupt_shared_quarantine_fails_closed_on_cached_download() {
         use crate::digest_quarantine::QuarantineMode;
         use crate::test_helpers::create_test_context_with_storage_and_config;
