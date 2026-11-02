@@ -305,6 +305,27 @@ async fn cached_central_date(
     valid_date_record(&record, path, bytes).then_some(record)
 }
 
+#[derive(Debug)]
+struct DateLookupUnavailable;
+
+fn date_lookup_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::RETRY_AFTER, "30"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        "Maven release date lookup unavailable; retry later",
+    )
+        .into_response()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DateLookupRetry {
+    timestamp: i64,
+    unavailable: bool,
+}
+
 /// A bounded fallback for an exact Central GAV; never trust the first search hit
 /// without matching every coordinate. Use the documented API, not UI endpoints.
 async fn fetch_maven_central_date(
@@ -313,9 +334,28 @@ async fn fetch_maven_central_date(
     artifact: &str,
     version: &str,
     timeout_secs: u64,
-) -> Option<i64> {
+) -> Result<Option<i64>, DateLookupUnavailable> {
+    fetch_maven_search_date(
+        client,
+        "https://search.maven.org/solrsearch/select",
+        group,
+        artifact,
+        version,
+        timeout_secs,
+    )
+    .await
+}
+
+async fn fetch_maven_search_date(
+    client: &reqwest::Client,
+    endpoint: &str,
+    group: &str,
+    artifact: &str,
+    version: &str,
+    timeout_secs: u64,
+) -> Result<Option<i64>, DateLookupUnavailable> {
     let response = client
-        .get("https://search.maven.org/solrsearch/select")
+        .get(endpoint)
         .query(&[
             (
                 "q",
@@ -328,12 +368,12 @@ async fn fetch_maven_central_date(
         .timeout(Duration::from_secs(timeout_secs.min(2)))
         .send()
         .await
-        .ok()?;
+        .map_err(|_| DateLookupUnavailable)?;
     if !response.status().is_success() {
-        return None;
+        return Err(DateLookupUnavailable);
     }
-    let json: serde_json::Value = response.json().await.ok()?;
-    matching_search_date(&json, group, artifact, version)
+    let json: serde_json::Value = response.json().await.map_err(|_| DateLookupUnavailable)?;
+    Ok(matching_search_date(&json, group, artifact, version))
 }
 
 fn matching_search_date(
@@ -361,15 +401,15 @@ async fn record_central_date(
     headers: &reqwest::header::HeaderMap,
     name: &str,
     version: &str,
-) -> Option<CentralArtifactDate> {
+) -> Result<Option<CentralArtifactDate>, DateLookupUnavailable> {
     if !url_is_maven_central(source.as_str()) || is_mutable_maven_path(path) {
-        return None;
+        return Ok(None);
     }
     let key = date_key(path, bytes);
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
     if let Some(record) = cached_central_date(state, path, bytes).await {
-        return Some(record);
+        return Ok(Some(record));
     }
     let header_date = headers
         .get(header::LAST_MODIFIED)
@@ -382,13 +422,23 @@ async fn record_central_date(
         None => {
             let miss_key = format!("{key}.retry");
             if let Ok(data) = state.storage.get(&miss_key).await {
-                if let Ok(previous) = serde_json::from_slice::<i64>(&data) {
-                    if (0..30).contains(&chrono::Utc::now().timestamp().saturating_sub(previous)) {
-                        return None;
+                if let Ok(previous) = serde_json::from_slice::<DateLookupRetry>(&data) {
+                    if (0..30).contains(
+                        &chrono::Utc::now()
+                            .timestamp()
+                            .saturating_sub(previous.timestamp),
+                    ) {
+                        return if previous.unavailable {
+                            Err(DateLookupUnavailable)
+                        } else {
+                            Ok(None)
+                        };
                     }
                 }
             }
-            let (group, artifact) = name.split_once(':')?;
+            let Some((group, artifact)) = name.split_once(':') else {
+                return Ok(None);
+            };
             match fetch_maven_central_date(
                 &state.http_client_no_redirect,
                 group,
@@ -398,14 +448,18 @@ async fn record_central_date(
             )
             .await
             {
-                Some(timestamp) => (timestamp, CentralDateKind::SearchIndex),
-                None => {
+                Ok(Some(timestamp)) => (timestamp, CentralDateKind::SearchIndex),
+                result => {
                     // A transient search failure is retried after 30s, never a
                     // permanent negative date. A good HTTP date bypasses it.
-                    if let Ok(data) = serde_json::to_vec(&chrono::Utc::now().timestamp()) {
+                    let retry = DateLookupRetry {
+                        timestamp: chrono::Utc::now().timestamp(),
+                        unavailable: result.is_err(),
+                    };
+                    if let Ok(data) = serde_json::to_vec(&retry) {
                         let _ = state.storage.put(&miss_key, &data).await;
                     }
-                    return None;
+                    return result.map(|_| None);
                 }
             }
         }
@@ -417,11 +471,15 @@ async fn record_central_date(
         kind,
     };
     if !valid_date_record(&record, path, bytes) {
-        return None;
+        return Ok(None);
     }
-    let data = serde_json::to_vec(&record).ok()?;
-    state.storage.create_internal(&key, &data).await.ok()?;
-    cached_central_date(state, path, bytes).await
+    let data = serde_json::to_vec(&record).map_err(|_| DateLookupUnavailable)?;
+    state
+        .storage
+        .create_internal(&key, &data)
+        .await
+        .map_err(|_| DateLookupUnavailable)?;
+    Ok(cached_central_date(state, path, bytes).await)
 }
 
 // ============================================================================
@@ -765,7 +823,7 @@ async fn download(
                     if trusted_origin && state.config.server.trust_upstream_dates && !internal {
                         match curation_coords.as_ref() {
                             Some((name, version)) => {
-                                record_central_date(
+                                match record_central_date(
                                     &state,
                                     &path,
                                     &data,
@@ -775,6 +833,22 @@ async fn download(
                                     version,
                                 )
                                 .await
+                                {
+                                    Ok(record) => record,
+                                    Err(_)
+                                        if !cooldown_exempt
+                                            && (matches!(
+                                                q_mode,
+                                                crate::digest_quarantine::QuarantineMode::Enforce
+                                            ) || matches!(
+                                                state.config.curation.mode,
+                                                crate::config::CurationMode::Enforce
+                                            )) =>
+                                    {
+                                        return date_lookup_unavailable_response()
+                                    }
+                                    Err(_) => None,
+                                }
                             }
                             None => None,
                         }
@@ -3452,6 +3526,138 @@ mod central_date_evidence_tests {
     use super::*;
     use crate::test_helpers::create_test_context_with_storage_and_config;
 
+    #[tokio::test]
+    async fn lookup_failures_are_retryable_but_empty_results_are_unknown() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let client = reqwest::Client::new();
+        for template in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(429),
+            ResponseTemplate::new(200).set_body_string("invalid JSON"),
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(2)),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            assert!(fetch_maven_search_date(
+                &client,
+                &server.uri(),
+                "org.example",
+                "demo",
+                "1.0",
+                1
+            )
+            .await
+            .is_err());
+        }
+        server.reset().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"response": {"docs": []}})),
+            )
+            .mount(&server)
+            .await;
+        assert!(
+            fetch_maven_search_date(&client, &server.uri(), "org.example", "demo", "1.0", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let response = date_lookup_unavailable_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn unavailable_backoff_does_not_seed_a_hold_and_good_header_recovers() {
+        let storage = crate::Storage::in_memory();
+        let ctx = create_test_context_with_storage_and_config(storage.clone(), |_| {});
+        let path = "org/example/demo/1.0/demo-1.0.pom";
+        let bytes = b"descriptor";
+        let source =
+            reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}")).unwrap();
+        storage
+            .put(
+                &format!("{}.retry", date_key(path, bytes)),
+                &serde_json::to_vec(&DateLookupRetry {
+                    timestamp: chrono::Utc::now().timestamp(),
+                    unavailable: true,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(record_central_date(
+            &ctx.state,
+            path,
+            bytes,
+            &source,
+            &reqwest::header::HeaderMap::new(),
+            "org.example:demo",
+            "1.0"
+        )
+        .await
+        .is_err());
+        assert!(storage
+            .list_internal(".nora-quarantine/maven/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage.get(&storage_key(path)).await.is_err());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        assert!(record_central_date(
+            &ctx.state,
+            path,
+            bytes,
+            &source,
+            &headers,
+            "org.example:demo",
+            "1.0"
+        )
+        .await
+        .unwrap()
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn pom_and_gradle_module_downloads_capture_dates_without_search() {
+        let ctx = create_test_context_with_storage_and_config(crate::Storage::in_memory(), |_| {});
+        for extension in ["pom", "module"] {
+            let path = format!("org/example/demo/1.0/demo-1.0.{extension}");
+            let source =
+                reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}"))
+                    .unwrap();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                header::LAST_MODIFIED,
+                HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+            );
+            let record = record_central_date(
+                &ctx.state,
+                &path,
+                b"descriptor",
+                &source,
+                &headers,
+                "org.example:demo",
+                "1.0",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(record.timestamp, 1699483767);
+            assert!(matches!(record.kind, CentralDateKind::LastModified));
+        }
+    }
+
     #[test]
     fn only_canonical_https_release_origins_are_trusted() {
         for url in [
@@ -3499,6 +3705,7 @@ mod central_date_evidence_tests {
             "1.0",
         )
         .await
+        .unwrap()
         .unwrap();
         assert_eq!(record.timestamp, 1699483767);
         let cached = cached_central_date(&b.state, path, bytes).await.unwrap();
@@ -3634,7 +3841,11 @@ mod central_date_evidence_tests {
         storage
             .put(
                 &format!("{}.retry", date_key(path, bytes)),
-                &serde_json::to_vec(&chrono::Utc::now().timestamp()).unwrap(),
+                &serde_json::to_vec(&DateLookupRetry {
+                    timestamp: chrono::Utc::now().timestamp(),
+                    unavailable: false,
+                })
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -3648,6 +3859,7 @@ mod central_date_evidence_tests {
             "1.0"
         )
         .await
+        .unwrap()
         .is_none());
         assert!(proxy_gate_shared_recoverable(
             &storage,
@@ -3678,6 +3890,7 @@ mod central_date_evidence_tests {
             "1.0",
         )
         .await
+        .unwrap()
         .unwrap();
         let evidence =
             TrustedReleaseEvidence::maven_central(record.timestamp, &record.source, bytes).unwrap();
