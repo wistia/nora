@@ -3086,7 +3086,7 @@ mod rate_limited_routes_tests {
             (RegistryType::Maven, "/maven2/com/example/x/1.0/x.html"),
             (RegistryType::Npm, "/npm/x"),
             (RegistryType::Cargo, "/cargo/index/config.json"),
-            (RegistryType::PyPI, "/simple/x/"),
+            (RegistryType::PyPI, "/pypi/simple/x/"),
             (RegistryType::Go, "/go/example.com/x/@v/list"),
             (RegistryType::Raw, "/raw/x/x.html"),
             (RegistryType::Gems, "/gems/specs.4.8.gz"),

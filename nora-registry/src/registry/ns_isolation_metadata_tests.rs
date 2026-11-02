@@ -19,7 +19,7 @@
 //! 4. a search query matching an internal pattern is NOT forwarded upstream.
 //!
 //! NB the test harness MERGES registry routers at the root (no per-registry nest),
-//! so pypi lives at `/simple/...`; and several registries default to `enabled:false`,
+//! so pypi lives at `/pypi/simple/...`; and several registries default to `enabled:false`,
 //! so each test turns its registry on explicitly.
 
 #![cfg(test)]
@@ -41,7 +41,7 @@ async fn pypi_internal_metadata_blocked_not_proxied() {
         c.pypi.proxy = Some(BLACKHOLE.to_string());
     });
     // Internal name, no local copy → 403 (never the BLACKHOLE upstream).
-    let resp = send(&ctx.app, Method::GET, "/simple/internalpkg/", "").await;
+    let resp = send(&ctx.app, Method::GET, "/pypi/simple/internalpkg/", "").await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -61,7 +61,7 @@ async fn pypi_internal_locally_published_served_hole5() {
         )
         .await
         .unwrap();
-    let resp = send(&ctx.app, Method::GET, "/simple/internalpkg/", "").await;
+    let resp = send(&ctx.app, Method::GET, "/pypi/simple/internalpkg/", "").await;
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -80,7 +80,7 @@ async fn pypi_public_metadata_not_blocked() {
         c.curation.internal_namespaces = vec!["internal*".to_string()];
         // no proxy, no local → a non-internal name resolves to 404, NOT a 403 block.
     });
-    let resp = send(&ctx.app, Method::GET, "/simple/publicpkg/", "").await;
+    let resp = send(&ctx.app, Method::GET, "/pypi/simple/publicpkg/", "").await;
     assert_eq!(
         resp.status(),
         StatusCode::NOT_FOUND,
@@ -406,7 +406,7 @@ async fn pypi_internal_download_served_local() {
     let resp = send(
         &ctx.app,
         Method::GET,
-        "/simple/internalpkg/internalpkg-1.0.tar.gz",
+        "/pypi/simple/internalpkg/internalpkg-1.0.tar.gz",
         "",
     )
     .await;
@@ -426,7 +426,7 @@ async fn pypi_internal_download_no_local_blocked() {
     let resp = send(
         &ctx.app,
         Method::GET,
-        "/simple/internalpkg/internalpkg-9.9.tar.gz",
+        "/pypi/simple/internalpkg/internalpkg-9.9.tar.gz",
         "",
     )
     .await;
@@ -826,7 +826,13 @@ async fn pypi_internal_refusal_increments_isolation_refused_metric() {
         .with_label_values(&["pypi"])
         .get();
     // Internal name, no local copy → check_namespace_isolation refusal (403).
-    let resp = send(&ctx.app, Method::GET, "/simple/internalpkg-metric/", "").await;
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/pypi/simple/internalpkg-metric/",
+        "",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let after = crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
         .with_label_values(&["pypi"])
@@ -848,8 +854,8 @@ async fn pypi_internal_refusal_increments_isolation_refused_metric() {
 const INTERNAL_PATHS: [&str; 35] = [
     "/npm/internalpkg",
     "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
-    "/simple/internalpkg/",
-    "/simple/internalpkg/internalpkg-1.0.tar.gz",
+    "/pypi/simple/internalpkg/",
+    "/pypi/simple/internalpkg/internalpkg-1.0.tar.gz",
     "/cargo/api/v1/crates/internalpkg",
     "/cargo/api/v1/crates/internalpkg/1.0.0/download",
     "/gems/info/internalpkg",
@@ -1007,11 +1013,11 @@ async fn a_hierarchical_namespace_isolates_pypi_projects_under_it() {
         c.pypi.proxy = Some(uri);
     });
     for path in [
-        "/simple/corp/",
-        "/simple/corp.tools/",
-        "/simple/corp-tools/",
-        "/simple/Corp_Tools/",
-        "/simple/corp-tools/corp_tools-1.0.tar.gz",
+        "/pypi/simple/corp/",
+        "/pypi/simple/corp.tools/",
+        "/pypi/simple/corp-tools/",
+        "/pypi/simple/Corp_Tools/",
+        "/pypi/simple/corp-tools/corp_tools-1.0.tar.gz",
     ] {
         let _ = send(&ctx.app, Method::GET, path, "").await;
     }
@@ -1026,7 +1032,7 @@ async fn a_hierarchical_namespace_isolates_pypi_projects_under_it() {
         requested.is_empty(),
         "internal projects sent upstream: {requested:?}"
     );
-    let _ = send(&ctx.app, Method::GET, "/simple/corporate/", "").await;
+    let _ = send(&ctx.app, Method::GET, "/pypi/simple/corporate/", "").await;
     assert_eq!(
         upstream.received_requests().await.unwrap().len(),
         1,
@@ -1057,11 +1063,11 @@ const INTERNAL_STORED: [(&str, &str); 11] = [
         "npm/internalpkg/versions/1.0.0.json",
     ),
     (
-        "/simple/internalpkg/internalpkg-1.0.tar.gz",
+        "/pypi/simple/internalpkg/internalpkg-1.0.tar.gz",
         "pypi/internalpkg/internalpkg-1.0.tar.gz",
     ),
     (
-        "/simple/internalpkg/",
+        "/pypi/simple/internalpkg/",
         "pypi/internalpkg/internalpkg-1.0.tar.gz",
     ),
     (
@@ -1155,7 +1161,7 @@ async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_a
     for path in [
         "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
         "/npm/publicpkg/-/publicpkg-1.0.0.tgz",
-        "/simple/publicpkg/",
+        "/pypi/simple/publicpkg/",
     ] {
         let status = send(&ctx.app, Method::GET, path, "").await.status();
         assert_eq!(
@@ -1199,7 +1205,7 @@ async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent
             "npm/internalcache/upstream/packument.json",
         ),
         (
-            "/simple/internalpkg/internalpkg-1.0.tar.gz",
+            "/pypi/simple/internalpkg/internalpkg-1.0.tar.gz",
             "pypi/internalpkg/internalpkg-1.0.tar.gz",
         ),
         (
@@ -1246,7 +1252,7 @@ async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent
     // upstream answers for it.
     for path in [
         "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
-        "/simple/publicpkg/",
+        "/pypi/simple/publicpkg/",
     ] {
         let status = send(&ctx.app, Method::GET, path, "").await.status();
         assert_ne!(
@@ -1644,7 +1650,7 @@ async fn an_internal_package_whose_copy_fails_its_integrity_check_is_500_in_ever
     // The project listing names its files from the store's listing and reads no copy of them.
     let reads_its_copy: Vec<(&str, &str)> = INTERNAL_STORED
         .into_iter()
-        .filter(|(path, _)| *path != "/simple/internalpkg/")
+        .filter(|(path, _)| *path != "/pypi/simple/internalpkg/")
         .collect();
     let mut wrong = not_500(&ctx, &outage, &reads_its_copy).await;
     let asked = upstream_paths(&upstream).await;

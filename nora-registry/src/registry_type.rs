@@ -54,7 +54,7 @@ registry_types! {
     Maven     => "maven",     "/maven2/",    "Maven";
     Npm       => "npm",       "/npm/",       "npm";
     Cargo     => "cargo",     "/cargo/",     "Cargo";
-    PyPI      => "pypi",      "/simple/",    "PyPI";
+    PyPI      => "pypi",      "/pypi/",    "PyPI";
     Go        => "go",        "/go/",        "Go";
     Raw       => "raw",       "/raw/",       "Raw";
     Gems      => "gems",      "/gems/",      "RubyGems";
