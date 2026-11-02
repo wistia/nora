@@ -388,6 +388,14 @@ async fn download(
             None
         };
 
+    let cooldown_exempt = curation_coords.as_ref().is_some_and(|(name, version)| {
+        state.curation().curation_engine.cooldown_exempt_version(
+            crate::curation::RegistryType::Maven,
+            name,
+            Some(version),
+        )
+    });
+
     // Curation check — only for versioned artifact files, not metadata
     if let Some((ref maven_name, ref maven_version)) = curation_coords {
         if !internal {
@@ -513,7 +521,7 @@ async fn download(
             // Quarantine only real version artifacts (.jar/.pom/.sha1, immutable
             // per version). maven-metadata.xml is mutable (curation_coords=None) —
             // never quarantine it or its digest would change forever.
-            if curation_coords.is_some() {
+            if curation_coords.is_some() && !cooldown_exempt {
                 if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
                     &state.storage,
                     &state.digest_store,
@@ -685,7 +693,7 @@ async fn download(
                     };
 
                 // Quarantine only real version artifacts; never maven-metadata.xml.
-                if curation_coords.is_some() {
+                if curation_coords.is_some() && !cooldown_exempt {
                     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
                         state.config.curation.maven.quarantine.as_ref().or(state
                             .config
@@ -751,7 +759,7 @@ async fn download(
                 return response;
             }
         }
-        if curation_coords.is_some() {
+        if curation_coords.is_some() && !cooldown_exempt {
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
                 state.config.curation.maven.quarantine.as_ref().or(state
                     .config
@@ -3175,6 +3183,52 @@ mod maven_version_metadata_identity {
 mod shared_maven_quarantine_regression {
     use crate::test_helpers::{create_test_context_with_storage_and_config, send};
     use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn exact_maven_exemption_skips_only_the_matching_version() {
+        let storage = crate::Storage::in_memory();
+        for v in ["1.0", "2.0"] {
+            storage
+                .put(
+                    &format!("maven/org/example/demo/{v}/demo-{v}.pom"),
+                    b"artifact",
+                )
+                .await
+                .unwrap();
+        }
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.maven.proxies.clear();
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+            cfg.curation.maven.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name": "org.example:demo", "version": "1.0"}),
+            )
+            .unwrap()];
+        });
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/org/example/demo/1.0/demo-1.0.pom",
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/org/example/demo/2.0/demo-2.0.pom",
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 
     #[tokio::test]
     async fn cached_artifact_is_held_consistently_across_replicas() {
