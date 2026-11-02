@@ -62,6 +62,7 @@ registry_types! {
     Ansible   => "ansible",   "/ansible/",   "Ansible";
     Nuget     => "nuget",     "/nuget/",     "NuGet";
     PubDart   => "pub",       "/pub/",       "Pub (Dart)";
+    Hex       => "hex",       "/hex/",       "Hex";
     Conan     => "conan",     "/conan/",     "Conan";
     Rpm       => "rpm",       "/rpm/",       "RPM";
     Deb       => "deb",       "/deb/",       "Debian";
@@ -87,7 +88,7 @@ impl RegistryType {
     /// format on. An opt-in format is enabled only by name: an operator who wrote `all`
     /// before it existed did not choose it.
     pub fn in_all(&self) -> bool {
-        !matches!(self, Self::HuggingFace)
+        !matches!(self, Self::HuggingFace | Self::Hex)
     }
 
     /// Parse from string (case-insensitive), accepting common aliases. Kept hand-written
@@ -106,6 +107,7 @@ impl RegistryType {
             "terraform" => Some(Self::Terraform),
             "ansible" => Some(Self::Ansible),
             "nuget" | "chocolatey" | "choco" | "powershellgallery" | "pwsh" => Some(Self::Nuget),
+            "hex" => Some(Self::Hex),
             "pub" | "pub_dart" | "dart" => Some(Self::PubDart),
             "conan" => Some(Self::Conan),
             "rpm" | "yum" | "dnf" => Some(Self::Rpm),

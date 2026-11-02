@@ -379,6 +379,7 @@ pub struct ReloadableConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
+    pub(crate) gems_cache: Arc<registry::gems_cache::CompactCache>,
     pub config: Arc<Config>,
     pub enabled_registries: Arc<HashSet<RegistryType>>,
     pub start_time: Instant,
@@ -2124,6 +2125,7 @@ async fn main() {
                     region = %config.storage.s3_region,
                     has_credentials = config.storage.s3_access_key.is_some(),
                     virtual_hosted = config.storage.s3_virtual_hosted,
+                    anonymous = config.storage.s3_anonymous,
                     "Using S3 storage"
                 );
             }
@@ -2134,6 +2136,7 @@ async fn main() {
                 expose_opt(&config.storage.s3_access_key),
                 expose_opt(&config.storage.s3_secret_key),
                 config.storage.s3_virtual_hosted,
+                config.storage.s3_anonymous,
             )
         }
         StorageMode::Gcs => {
@@ -2357,6 +2360,7 @@ async fn main() {
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    config.storage.s3_anonymous,
                 ),
                 "gcs" => Storage::new_gcs(
                     &config.storage.bucket,
@@ -2378,6 +2382,7 @@ async fn main() {
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    config.storage.s3_anonymous,
                 ),
                 "gcs" => Storage::new_gcs(
                     &config.storage.bucket,
@@ -3092,6 +3097,7 @@ mod rate_limited_routes_tests {
             (RegistryType::Ansible, "/ansible/"),
             (RegistryType::Nuget, "/nuget/v3/autocomplete"),
             (RegistryType::PubDart, "/pub/api/packages"),
+            (RegistryType::Hex, "/hex/public_key"),
             (RegistryType::Conan, "/conan/v1/ping"),
             (RegistryType::Rpm, "/rpm/x/x.html"),
             (RegistryType::Deb, "/deb/x/x.html"),
@@ -3472,6 +3478,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let (tasks, maintenance) = supervision(&config.server);
     let state = AppState {
+        gems_cache: Arc::default(),
         storage,
         config: Arc::new(config),
         enabled_registries,
@@ -5057,8 +5064,13 @@ fn reload_curation(
 /// window: the same parse that is checked is the one that is installed.
 ///
 /// In audit/off mode a parse error is logged and the filter dropped (the
-/// engine is advisory there), so this never returns `Err`.
+/// engine is advisory there). Invalid cooldown exemption declarations are refused
+/// in every mode, as at startup.
 fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, String> {
+    let exemption_errors = config.curation.cooldown_exemption_errors();
+    if !exemption_errors.is_empty() {
+        return Err(exemption_errors.join("; "));
+    }
     let enforce = config.curation.mode == CurationMode::Enforce;
     let mut engine = curation::CurationEngine::new(config.curation.clone());
 
@@ -5148,6 +5160,9 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
                 registry_routes = registry_routes
                     .merge(registry::nuget_routes())
                     .merge(registry::nuget_alias_routes())
+            }
+            RegistryType::Hex => {
+                registry_routes = registry_routes.merge(registry::hex_registry::routes())
             }
             RegistryType::PubDart => {
                 registry_routes = registry_routes.merge(registry::pub_dart_routes())

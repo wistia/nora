@@ -21,6 +21,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
 | Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |
 | NuGet | ✅ | ❌ | `api.nuget.org` | proxy only — `dotnet nuget push` not implemented |
+| Hex (Elixir) | ✅ | ❌ | `repo.hex.pm` | opt-in; public Hex.pm; signed records preserved; server tarball cooldown |
 | Pub (Dart/Flutter) | ✅ | ❌ | `pub.dev` | proxy only — `dart pub publish` not implemented |
 | CPAN | ✅ | — | `www.cpan.org` | proxy only |
 | Conan (C/C++) | ✅ | ❌ | `center2.conan.io` | proxy only (Conan 2 clients) |
@@ -536,7 +537,7 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
 | Swagger/OpenAPI | Full | `/api-docs` |
-| S3 backend | Full | AWS S3, Ceph RGW. Basic storage works on any S3-compatible; multi-replica write-serialization has a caveat — see note below. |
+| S3 backend | Full | AWS S3, Ceph RGW. Explicit keys or AWS environment/IRSA/EKS Pod Identity/ECS/EC2 credentials; unsigned access requires `storage.s3_anonymous = true`. See [S3 credentials](docs/s3-credentials.md). Multi-replica write-serialization has a caveat — see note below. |
 | GCS backend | Full | Native Google Cloud Storage (`storage.mode = "gcs"`): Workload Identity / service-account JSON / ambient credentials; endpoint override for emulators and Private Google Access. Same single-writer caveat as S3 for rpm/deb publishing (in-process publish lock). Hash-pinning (at-rest integrity verification) works on every backend: the pin is the `sha256` object metadata on S3/GCS. |
 | Local filesystem backend | Full | Default, content-addressable |
 | Activity log | Full | Recent push/pull in dashboard |
@@ -563,3 +564,16 @@ workload identity from CI, send the JWT as a `Bearer` token (e.g.
   AWS S3 and Ceph RGW provide it; **Garage** (no consensus layer) and **SeaweedFS**
   (immature) do not — on those, run single-writer. Not every "S3-compatible" backend is
   equivalent here.
+
+## Hex (Elixir)
+
+Explicitly opt-in (`hex` in `[registries].enable`; excluded from `all`). Public
+Hex.pm GET/HEAD package records, names, versions, tarballs and public key are
+supported. Records retain original signatures and origin; tarballs are checked
+against signed outer checksums. Server-side cooldown applies to locked and direct
+downloads; Hex 2.6.0 client cooldown helps resolution without rewriting metadata.
+Exact `curation.hex.cooldown_exempt_packages` entries skip only the server cooldown;
+cryptographic verification and other curation checks remain active.
+Publishing, private repositories, docs, installation archives, CLI mirror and
+import are outside this implementation. See [configuration and trust](docs/hex.md)
+and [real-client verification](tests/hex-client/VERIFICATION.md).
