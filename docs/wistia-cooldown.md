@@ -80,3 +80,28 @@ Maven artifacts use shared object-store quarantine records so replicas agree on 
 Maven exact-version cooldown exemptions use `[[curation.maven.cooldown_exempt_versions]]` entries with a case-sensitive `group.id:artifact-id` name and exact version. These entries skip release-age and digest-quarantine checks only; blocklists, integrity and namespace checks still apply. Exemptions do not grant access to private upstream artifacts.
 
 Maven metadata XML and all checksum sidecars use `Cache-Control: no-store`, as do snapshot paths. Stable XML and checksum URLs can be fetched and revalidated independently; equal TTLs do not ensure generation consistency. Long stale windows are deferred until a generation-consistent strategy is available. Existing cached metadata and sidecars require CloudFront invalidation when this policy deploys. Release artifact caching is unchanged.
+
+### Maven Central release-date evidence
+
+With `trust_upstream_dates=true`, immutable files fetched directly from the HTTPS release repositories `repo.maven.apache.org/maven2` or `repo1.maven.org/maven2` can use the successful GET response's `Last-Modified` as trusted upstream date evidence. This is an explicit trust in the origin's reported modification time, not cryptographic proof of publication time. Redirected, authenticated, private, snapshot, and look-alike origins do not provide this evidence. Search websites are not artifact repository aliases.
+
+Nora stores successful evidence under `.nora-maven-dates/`, bound to the exact artifact path, source URL and byte digest. A warm artifact reads shared evidence instead of querying search. For a cold canonical Central response without a usable header, Nora uses the documented exact-GAV search API with a two-second cap and verifies every returned coordinate. Lookup timeouts, upstream errors, and malformed responses (including valid JSON with an invalid search envelope or upstream error status) return `503 Service Unavailable` with `Retry-After: 30` and `Cache-Control: no-store` when cooldown enforcement requires a date; the shared thirty-second backoff preserves this retryable result without seeding a quarantine hold or publishing bytes. A successful lookup with no usable date continues through the unknown-date quarantine policy. Missing shared date records also retain that policy; storage errors, corrupt records, and failed evidence readback return retryable 503 when dates are required. A blocklist-only policy does not require a date lookup to succeed. A valid curation bypass token removes the release-age requirement but does not bypass enforced digest quarantine. Range requests retain partial storage reads when no digest-bound date or integrity checks are needed, including valid curation bypass requests when digest quarantine is off. POM and Gradle `.module` downloads capture their own response dates just like JARs, without an extra timestamp request; these dates are not reused for other files in the version. Newly held bytes are not published to the artifact cache before a successful quarantine decision, so later cold retries can recover evidence. Starting from a clean enforced store is the supported rollout; enabling enforcement over pre-existing unknown-date cached bytes requires separate migration handling.
+
+## Recovering a shared Maven unknown-date hold
+
+The explicit recoverable Maven quarantine API preserves the original shared
+`first_seen` observation and tags newly created records with timestamp provenance.
+Validated Central release evidence is stored independently under
+`.nora-quarantine-release/maven/`, using conditional creation and read-back so
+replicas agree without rewriting the observation. Only canonical HTTPS Central
+artifact URLs, valid nonfuture dates and evidence bound to the served SHA-256
+content digest qualify. Evidence establishes the age of those bytes, not the
+release date of every GAV containing them: the handler must separately evaluate
+its exact artifact's release-age rule using current validated evidence.
+
+Recovery requires upstream-date trust to remain enabled and current evidence to
+be supplied by the handler. Missing evidence keeps the original hold, disabling
+trust immediately stops using recovery evidence, and unreadable or corrupt state
+fails closed. Untagged records retain their existing hold. This API's recovery is
+for shared object storage; the local JSONL ledger remains conservative and starts
+from the local observation without accepting release-date recovery.

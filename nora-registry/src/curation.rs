@@ -370,6 +370,25 @@ impl CurationEngine {
 // check_download() — handler integration helper (issue #187)
 // ============================================================================
 
+/// Whether this request supplies the configured curation bypass token.
+/// Keep the comparison constant-time for all handler policy decisions.
+pub(crate) fn has_valid_bypass_token(
+    bypass_token: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    match bypass_token {
+        Some(token) => headers
+            .get("x-nora-bypass-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                // Constant-time comparison to prevent timing side-channel
+                v.as_bytes().ct_eq(token.as_bytes()).into()
+            })
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 /// Check curation policy for a download request.
 ///
 /// Returns `Some(Response)` if blocked (403 in enforce mode), `None` to proceed.
@@ -387,17 +406,7 @@ pub fn check_download(
     version: RequestVersion,
     publish_date: Option<i64>,
 ) -> Option<Response> {
-    let bypass = match bypass_token {
-        Some(token) => headers
-            .get("x-nora-bypass-token")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                // Constant-time comparison to prevent timing side-channel
-                v.as_bytes().ct_eq(token.as_bytes()).into()
-            })
-            .unwrap_or(false),
-        None => false,
-    };
+    let bypass = has_valid_bypass_token(bypass_token, headers);
 
     let request = FilterRequest {
         registry,

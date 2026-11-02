@@ -506,6 +506,222 @@ pub async fn proxy_gate_shared(
     })
 }
 
+/// Release evidence is accepted only for bytes retrieved from a canonical Central
+/// artifact URL. The caller must additionally enable `trust_upstream_dates` and
+/// establish that the timestamp belongs to that response (or verified digest cache).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TrustedReleaseEvidence {
+    published_at: i64,
+    artifact_url: String,
+    digest: String,
+}
+
+impl TrustedReleaseEvidence {
+    pub(crate) fn maven_central(
+        published_at: i64,
+        artifact_url: &str,
+        bytes: &[u8],
+    ) -> Option<Self> {
+        use sha2::Digest;
+        let url = reqwest::Url::parse(artifact_url).ok()?;
+        if published_at <= 0
+            || published_at > Utc::now().timestamp()
+            || url.scheme() != "https"
+            || !matches!(
+                url.host_str(),
+                Some("repo.maven.apache.org" | "repo1.maven.org")
+            )
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let artifact = url.path().strip_prefix("/maven2/")?;
+        if artifact.split('/').count() < 4
+            || artifact
+                .split('/')
+                .any(|part| part.ends_with("-SNAPSHOT") || part.starts_with("maven-metadata.xml"))
+            || artifact.ends_with('/')
+            || artifact.contains('%')
+            || crate::validation::validate_storage_key(artifact).is_err()
+        {
+            return None;
+        }
+        Some(Self {
+            published_at,
+            artifact_url: url.to_string(),
+            digest: format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes))),
+        })
+    }
+
+    fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        Self::maven_central(self.published_at, &self.artifact_url, bytes)
+            .is_some_and(|validated| validated.digest == self.digest)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SharedTimestampOrigin {
+    FallbackObservation,
+    TrustedRelease,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RecoverableDigestEntry {
+    #[serde(flatten)]
+    entry: DigestEntry,
+    #[serde(default)]
+    timestamp_origin: Option<SharedTimestampOrigin>,
+}
+
+/// Maven-only shared quarantine with explicit trusted-date recovery. The original
+/// observation is immutable; independently immutable release evidence supplies the
+/// eligibility date only while upstream-date trust is enabled. Legacy records and
+/// local JSONL ledgers retain their conservative behavior.
+#[allow(clippy::too_many_arguments)]
+#[must_use = "the returned response blocks a quarantined artifact"]
+pub(crate) async fn proxy_gate_shared_recoverable(
+    storage: &crate::Storage,
+    local: &DigestStore,
+    registry: &str,
+    bytes: &[u8],
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    upstream: &str,
+    trust_upstream_dates: bool,
+    trusted_release: Option<&TrustedReleaseEvidence>,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    let evidence = trusted_release.filter(|_| trust_upstream_dates);
+    if registry != "maven" || evidence.is_some_and(|e| !e.matches_bytes(bytes)) {
+        return matches!(mode, QuarantineMode::Enforce).then(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Invalid trusted release evidence",
+            )
+                .into_response()
+        });
+    }
+    if storage.backend_name() == "local" {
+        return proxy_gate_dated(
+            local,
+            registry,
+            bytes,
+            mode,
+            quarantine_secs,
+            upstream,
+            // The legacy local ledger has no reversible provenance/evidence record.
+            // Keep this new API conservative rather than permanently seeding it.
+            None,
+        );
+    }
+    use sha2::Digest;
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+    let key = format!(
+        ".nora-quarantine/{registry}/{}.json",
+        digest.trim_start_matches("sha256:")
+    );
+    let evidence_key = format!(
+        ".nora-quarantine-release/{registry}/{}.json",
+        digest.trim_start_matches("sha256:")
+    );
+    let now = Utc::now().timestamp();
+    let result: Result<i64, String> = async {
+        let record = match storage.get(&key).await {
+            Ok(data) => data,
+            Err(crate::storage::StorageError::NotFound) => {
+                let entry = RecoverableDigestEntry {
+                    entry: DigestEntry { registry: registry.to_owned(), digest: digest.clone(), first_seen: now, upstream: RecordedUrl::new(upstream) },
+                    timestamp_origin: Some(if evidence.is_some() { SharedTimestampOrigin::TrustedRelease } else { SharedTimestampOrigin::FallbackObservation }),
+                };
+                let data = serde_json::to_vec(&entry).map_err(|e| e.to_string())?;
+                storage.create_internal(&key, &data).await.map_err(|e| e.to_string())?;
+                storage.get(&key).await.map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let record: RecoverableDigestEntry = serde_json::from_slice(&record).map_err(|e| e.to_string())?;
+        if record.entry.registry != registry || record.entry.digest != digest || record.entry.first_seen < 0 {
+            return Err("quarantine record does not match its key or clock".to_owned());
+        }
+        let first_seen = record.entry.first_seen;
+        if record.timestamp_origin.is_none() {
+            warn!(%registry, %digest, "legacy quarantine record has no release-date provenance; retaining original hold");
+            return Ok(first_seen);
+        }
+        // The handler must know the current release date too, so its independent
+        // min-release-age filter can evaluate stricter thresholds before this gate.
+        if !trust_upstream_dates || evidence.is_none() {
+            return Ok(first_seen);
+        }
+        let saved = match storage.get(&evidence_key).await {
+            Ok(data) => Some(data),
+            Err(crate::storage::StorageError::NotFound) => match evidence {
+                Some(evidence) => {
+                    let data = serde_json::to_vec(evidence).map_err(|e| e.to_string())?;
+                    let created = storage.create_internal(&evidence_key, &data).await.map_err(|e| e.to_string())?;
+                    if created {
+                        info!(%registry, %digest, observed_first_seen = first_seen,
+                            trusted_release_date = evidence.published_at,
+                            source = %evidence.artifact_url,
+                            "shared quarantine trusted release evidence recorded; original observation preserved");
+                    }
+                    Some(storage.get(&evidence_key).await.map_err(|e| e.to_string())?)
+                }
+                None => None,
+            },
+            Err(e) => return Err(e.to_string()),
+        };
+        let Some(saved) = saved else { return Ok(first_seen); };
+        let saved: TrustedReleaseEvidence = serde_json::from_slice(&saved).map_err(|e| e.to_string())?;
+        if !saved.matches_bytes(bytes) {
+            return Err("trusted release evidence does not match artifact bytes or source".to_owned());
+        }
+        Ok(first_seen.min(saved.published_at))
+    }.await;
+    let first_seen = match result {
+        Ok(first_seen) => first_seen,
+        Err(error) => {
+            tracing::error!(%registry, %digest, %error, "shared recoverable quarantine unavailable");
+            return matches!(mode, QuarantineMode::Enforce).then(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Shared quarantine state unavailable",
+                )
+                    .into_response()
+            });
+        }
+    };
+    let remaining_secs = quarantine_secs.saturating_sub(now.saturating_sub(first_seen));
+    if remaining_secs <= 0 {
+        return None;
+    }
+    crate::metrics::QUARANTINE_HOLDS_TOTAL
+        .with_label_values(&[
+            registry,
+            if matches!(mode, QuarantineMode::Enforce) {
+                "blocked"
+            } else {
+                "observed"
+            },
+        ])
+        .inc();
+    matches!(mode, QuarantineMode::Enforce).then(|| {
+        quarantine_forbidden(
+            registry,
+            &digest,
+            &QuarantineStatus::Pending { remaining_secs },
+            quarantine_secs,
+        )
+    })
+}
+
 /// Build a generic 403 for a quarantined proxy artifact (non-Docker shape).
 ///
 /// Names the responsible policy (`registry` + `quarantine_ttl_secs` + how much
@@ -1322,5 +1538,250 @@ mod shared_tests {
         assert_ne!(a.unwrap(), b.unwrap());
         let winner = storage.get(".nora-quarantine/test").await.unwrap();
         assert!(winner.as_ref() == b"a" || winner.as_ref() == b"b");
+    }
+}
+
+#[cfg(test)]
+mod trusted_release_recovery_tests {
+    use super::*;
+    use sha2::Digest;
+
+    const URL: &str = "https://repo.maven.apache.org/maven2/org/example/demo/1.0/demo-1.0.jar";
+    const TTL: i64 = 7 * 86400;
+    const BYTES: &[u8] = b"artifact bytes";
+
+    fn keys() -> (String, String) {
+        let digest = hex::encode(sha2::Sha256::digest(BYTES));
+        (
+            format!(".nora-quarantine/maven/{digest}.json"),
+            format!(".nora-quarantine-release/maven/{digest}.json"),
+        )
+    }
+
+    async fn gate(
+        storage: &crate::Storage,
+        local: &DigestStore,
+        trust: bool,
+        evidence: Option<&TrustedReleaseEvidence>,
+    ) -> Option<Response> {
+        proxy_gate_shared_recoverable(
+            storage,
+            local,
+            "maven",
+            BYTES,
+            &QuarantineMode::Enforce,
+            TTL,
+            URL,
+            trust,
+            evidence,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recoverable_quarantine_shares_recovery_without_rewriting_observation() {
+        let storage = crate::Storage::in_memory();
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = DigestStore::empty(a_dir.path().to_str().unwrap());
+        let b = DigestStore::empty(b_dir.path().to_str().unwrap());
+        assert_eq!(
+            gate(&storage, &a, true, None).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let (key, recovery_key) = keys();
+        let original = storage.get(&key).await.unwrap();
+        let record: RecoverableDigestEntry = serde_json::from_slice(&original).unwrap();
+        assert!(matches!(
+            record.timestamp_origin,
+            Some(SharedTimestampOrigin::FallbackObservation)
+        ));
+        let old =
+            TrustedReleaseEvidence::maven_central(Utc::now().timestamp() - TTL - 60, URL, BYTES)
+                .unwrap();
+        let (one, two) = tokio::join!(
+            gate(&storage, &a, true, Some(&old)),
+            gate(&storage, &b, true, Some(&old))
+        );
+        assert!(one.is_none());
+        assert!(two.is_none());
+        assert_eq!(storage.get(&key).await.unwrap(), original);
+        assert!(storage.get(&recovery_key).await.is_ok());
+        // Missing caller evidence cannot silently bypass a stricter release-age
+        // rule which the handler was unable to evaluate.
+        assert_eq!(
+            gate(&storage, &b, true, None).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        // Disabling upstream trust stops using the independent evidence immediately.
+        assert_eq!(
+            gate(&storage, &b, false, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_quarantine_keeps_young_releases_held() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let young =
+            TrustedReleaseEvidence::maven_central(Utc::now().timestamp() - 60, URL, BYTES).unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&young))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            gate(&storage, &local, true, None).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_quarantine_rejects_evidence_for_other_bytes() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let wrong = TrustedReleaseEvidence::maven_central(1, URL, b"different bytes").unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&wrong))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_quarantine_does_not_override_legacy_holds() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let (key, _) = keys();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(BYTES)));
+        let legacy = DigestEntry {
+            registry: "maven".into(),
+            digest,
+            first_seen: Utc::now().timestamp(),
+            upstream: RecordedUrl::new(URL),
+        };
+        let original = serde_json::to_vec(&legacy).unwrap();
+        storage.put(&key, &original).await.unwrap();
+        let old = TrustedReleaseEvidence::maven_central(1, URL, BYTES).unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            storage.get(&key).await.unwrap().as_ref(),
+            original.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_quarantine_fails_closed_on_corrupt_state_even_with_old_date() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let (key, recovery_key) = keys();
+        let old = TrustedReleaseEvidence::maven_central(1, URL, BYTES).unwrap();
+        storage.put(&key, b"bad record").await.unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        storage.delete(&key).await.unwrap();
+        assert!(gate(&storage, &local, true, Some(&old)).await.is_none());
+        storage.put(&recovery_key, b"bad evidence").await.unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_quarantine_preserves_conservative_local_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::Storage::new_local(dir.path().to_str().unwrap());
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        assert_eq!(
+            gate(&storage, &local, true, None).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let old = TrustedReleaseEvidence::maven_central(1, URL, BYTES).unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh_storage = crate::Storage::new_local(fresh_dir.path().to_str().unwrap());
+        let fresh_local = DigestStore::empty(fresh_dir.path().to_str().unwrap());
+        assert_eq!(
+            gate(&fresh_storage, &fresh_local, true, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            gate(&fresh_storage, &fresh_local, false, Some(&old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn trusted_release_evidence_requires_canonical_central_artifact_and_valid_time() {
+        assert!(TrustedReleaseEvidence::maven_central(1, URL, BYTES).is_some());
+        for date in [-1, 0, Utc::now().timestamp() + 3600] {
+            assert!(TrustedReleaseEvidence::maven_central(date, URL, BYTES).is_none());
+        }
+        assert!(TrustedReleaseEvidence::maven_central(
+            1,
+            &URL.replace("repo.maven.apache.org", "repo1.maven.org"),
+            BYTES
+        )
+        .is_some());
+        for url in [
+            URL.replace("https:", "http:"),
+            URL.replace(
+                "repo.maven.apache.org",
+                "repo.maven.apache.org.evil.example",
+            ),
+            URL.replace("repo.maven.apache.org", "repo.maven.apache.org:8443"),
+            URL.replace("https://", "https://user:pass@"),
+            format!("{URL}?x=1"),
+            format!("{URL}#x"),
+            URL.replace("/maven2/", "/other/"),
+            "https://repo.maven.apache.org/maven2/".to_owned(),
+            URL.replace("demo-1.0.jar", "demo%2fother.jar"),
+            URL.replace("/1.0/", "/1.0-SNAPSHOT/"),
+            URL.replace("demo-1.0.jar", "maven-metadata.xml"),
+        ] {
+            assert!(
+                TrustedReleaseEvidence::maven_central(1, &url, BYTES).is_none(),
+                "{url}"
+            );
+        }
     }
 }
