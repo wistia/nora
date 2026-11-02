@@ -218,7 +218,14 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
     };
     valid_name
         && match registry {
-            RegistryType::Maven => component(version),
+            RegistryType::Maven => {
+                !version.is_empty()
+                    && version != "."
+                    && version != ".."
+                    && version
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._~+".contains(&b))
+            }
             RegistryType::Npm => crate::curation::npm_version_key(version).is_some(),
             RegistryType::Go => crate::curation::go_version_key(version).is_some(),
             RegistryType::Hex => crate::curation::pub_version_key(version).is_some(),
@@ -664,6 +671,23 @@ impl CurationConfig {
 #[cfg(test)]
 mod prefix_tests {
     use super::*;
+
+    #[test]
+    fn maven_exact_versions_accept_build_qualifiers() {
+        assert!(valid_exempt_identity(
+            RegistryType::Maven,
+            "org.example:demo",
+            "1.0+build"
+        ));
+        for (name, version) in [
+            ("org.example:..", "1.0"),
+            ("org.example:demo", "1:0"),
+            ("org.example:demo", "?"),
+            ("org.example:demo", ".."),
+        ] {
+            assert!(!valid_exempt_identity(RegistryType::Maven, name, version));
+        }
+    }
 
     #[test]
     fn gems_exemptions_are_exact_names_not_prefixes_or_patterns() {
