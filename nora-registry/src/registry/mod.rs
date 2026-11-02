@@ -1833,16 +1833,16 @@ mod tests {
             format!("[{a}][{b}]")
         }
         let app: axum::Router = axum::Router::new()
-            .route("/simple/{name}/", get(one))
-            .route("/simple/{name}/{filename}", get(two))
+            .route("/pypi/simple/{name}/", get(one))
+            .route("/pypi/simple/{name}/{filename}", get(two))
             .route("/gems/info/{name}", get(one))
             .route("/w/{*path}", get(one))
             .route("/r/{repo}/{*path}", get(two));
         let cases = [
-            ("/simple//", Some("[]")),
-            ("/simple//x", Some("[][x]")),
-            ("/simple/foo%2F/", Some("[foo/]")),
-            ("/simple/%2Ffoo/x", Some("[/foo][x]")),
+            ("/pypi/simple//", Some("[]")),
+            ("/pypi/simple//x", Some("[][x]")),
+            ("/pypi/simple/foo%2F/", Some("[foo/]")),
+            ("/pypi/simple/%2Ffoo/x", Some("[/foo][x]")),
             ("/gems/info/", None),
             ("/gems/info/x%2F%2Fy", Some("[x//y]")),
             ("/w/a//b", Some("[a//b]")),
@@ -2008,7 +2008,7 @@ mod first_download_integrity {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(SERVED.to_vec()))
             .mount(&s)
             .await;
-        let uri = "/simple/corp-lib/corp_lib-1.0.0.tar.gz";
+        let uri = "/pypi/simple/corp-lib/corp_lib-1.0.0.tar.gz";
         refused(&s, "pypi", "corp-lib", "1.0.0", uri, |c, u| {
             c.pypi.proxies = serde_json::from_value(serde_json::json!([u])).unwrap();
         })
@@ -2361,7 +2361,7 @@ mod first_download_integrity {
         let resp = crate::test_helpers::send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "/pypi/simple/corp-lib/corp_lib-1.0.0.tar.gz",
             vec![("range", "bytes=0-")],
             "",
         )
@@ -2438,7 +2438,7 @@ mod first_download_integrity {
             "pypi",
             "corp-lib",
             "1.0.0",
-            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "/pypi/simple/corp-lib/corp_lib-1.0.0.tar.gz",
             "pypi/corp-lib/corp_lib-1.0.0.tar.gz",
             |c, u| c.pypi.proxies = serde_json::from_value(serde_json::json!([u])).unwrap(),
         )
@@ -3038,7 +3038,7 @@ mod pypi_credential_host {
         let _ = send(
             &ctx.app,
             Method::GET,
-            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "/pypi/simple/corp-lib/corp_lib-1.0.0.tar.gz",
             "",
         )
         .await;
@@ -3089,7 +3089,7 @@ mod pypi_credential_host {
         let _ = send(
             &ctx.app,
             Method::GET,
-            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "/pypi/simple/corp-lib/corp_lib-1.0.0.tar.gz",
             "",
         )
         .await;
@@ -3134,7 +3134,7 @@ mod pypi_credential_host {
         let resp = send(
             &ctx.app,
             Method::GET,
-            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "/pypi/simple/corp-lib/corp_lib-1.0.0.tar.gz",
             "",
         )
         .await;
@@ -3331,12 +3331,12 @@ mod upstream_failure_matrix {
 
     #[tokio::test]
     async fn pypi_simple_index() {
-        run("/simple/flask/", pypi, true).await;
+        run("/pypi/simple/flask/", pypi, true).await;
     }
 
     #[tokio::test]
     async fn pypi_file() {
-        run("/simple/flask/flask-2.0.tar.gz", pypi, true).await;
+        run("/pypi/simple/flask/flask-2.0.tar.gz", pypi, true).await;
     }
 
     #[tokio::test]

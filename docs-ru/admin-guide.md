@@ -339,7 +339,7 @@ nora gc              # Удаление осиротевших блобов
 **Подготовка к работе без доступа к сети Интернет.** Не для всех форматов `nora mirror`
 загружает всё, что нужно клиенту:
 
-- `nora mirror pip` загружает только страницы индекса `/simple/<имя>/`, без файлов пакетов;
+- `nora mirror pip` загружает только страницы индекса `/pypi/simple/<имя>/`, без файлов пакетов;
 - `nora mirror cargo` загружает только архивы `.crate`, без sparse-индекса;
 - `nora mirror docker` не загружает образ, если у него не хватает слоя или вложенного
   манифеста, и завершается ошибкой;
@@ -421,7 +421,7 @@ nora migrate --from local --to s3              # Выполнение
 | Docker / OCI | `/v2/` | Docker Registry V2 API |
 | npm | `/npm/` | npm-реестр (прокси + публикация) |
 | Maven | `/maven2/` | Maven-репозиторий |
-| PyPI | `/simple/` | Python Simple API (PEP 503) |
+| PyPI | `/pypi/simple/` | Python Simple API (PEP 503) |
 | Cargo | `/cargo/` | Cargo-реестр |
 | Helm | `/v2/` (OCI) | Helm-чарты через OCI-протокол |
 | Raw | `/raw/` | Произвольные файлы |

@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_detect_registry_pypi() {
-        assert_eq!(detect_registry("/simple/requests/"), "pypi");
+        assert_eq!(detect_registry("/pypi/simple/requests/"), "pypi");
         assert_eq!(
             detect_registry("/packages/requests/1.0/requests-1.0.tar.gz"),
             "pypi"
@@ -1011,7 +1011,7 @@ mod tests {
             "/maven2/com/example/artifact/1.0/artifact-1.0.jar",
             "/npm/lodash",
             "/cargo/api/v1/crates/serde",
-            "/simple/requests/",
+            "/pypi/simple/requests/",
             "/packages/requests/1.0/requests-1.0.tar.gz",
             "/go/github.com/user/repo/@v/v1.0.0.info",
             "/raw/my-project/artifact.tar.gz",

@@ -172,7 +172,7 @@ diff_pypi() {
     
     # 1. /simple/ returns HTML or JSON
     local simple_html
-    simple_html=$(curl -s -H "Accept: text/html" "$NORA_URL/simple/" 2>/dev/null)
+    simple_html=$(curl -s -H "Accept: text/html" "$NORA_URL/pypi/simple/" 2>/dev/null)
     if echo "$simple_html" | grep -qi "<!DOCTYPE\|<html\|simple" &>/dev/null; then
         ok "/simple/ returns HTML index"
     else
@@ -181,7 +181,7 @@ diff_pypi() {
     
     # 2. PEP 691 JSON response
     local simple_json
-    simple_json=$(curl -s -H "Accept: application/vnd.pypi.simple.v1+json" "$NORA_URL/simple/" 2>/dev/null)
+    simple_json=$(curl -s -H "Accept: application/vnd.pypi.simple.v1+json" "$NORA_URL/pypi/simple/" 2>/dev/null)
     if echo "$simple_json" | jq -e '.projects // .meta' &>/dev/null; then
         ok "/simple/ PEP 691 JSON works"
     else

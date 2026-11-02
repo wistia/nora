@@ -5064,7 +5064,7 @@ mod rule_names_in_published_spelling {
         });
         for uri in [
             "/nuget/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
-            "/simple/flask-restful/Flask-RESTful-0.3.9.tar.gz",
+            "/pypi/simple/flask-restful/Flask-RESTful-0.3.9.tar.gz",
             "/cargo/api/v1/crates/Inflector/0.11.4/download",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
@@ -5089,7 +5089,7 @@ mod rule_names_in_published_spelling {
         });
         for uri in [
             "/nuget/v3/flatcontainer/corp.internal/1.0.0/corp.internal.1.0.0.nupkg",
-            "/simple/corp-tools/",
+            "/pypi/simple/corp-tools/",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert!(!resp.status().is_success(), "{uri}: {}", resp.status());
