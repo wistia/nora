@@ -624,6 +624,33 @@ pub(crate) async fn proxy_fetch(
     .await
 }
 
+/// Fetch bytes together with the exact successful response's headers and URL.
+/// Callers that trust provenance must use a non-redirecting client.
+pub(crate) async fn proxy_fetch_with_headers(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<(Vec<u8>, reqwest::header::HeaderMap, reqwest::Url), ProxyError> {
+    proxy_fetch_core(
+        client,
+        url,
+        timeout,
+        auth,
+        None,
+        |r| async {
+            let headers = r.headers().clone();
+            let url = r.url().clone();
+            r.bytes().await.map(|bytes| (bytes.to_vec(), headers, url))
+        },
+        cb,
+        scope,
+    )
+    .await
+}
+
 /// Fetch text content from upstream proxy with timeout and 1 retry.
 pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,

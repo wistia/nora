@@ -12,9 +12,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::config::UpstreamAuth;
-use crate::registry::{
-    circuit_open_response, method_not_allowed, proxy_fetch, ProxyError, UpstreamMiss,
-};
+use crate::registry::{circuit_open_response, method_not_allowed, ProxyError, UpstreamMiss};
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
 use crate::validation::ends_with_ci;
@@ -245,27 +243,62 @@ fn is_mutable_maven_path(path: &str) -> bool {
 /// Maven upstream with a per-artifact date source (its search API). A private mirror
 /// (Nexus/Artifactory) returns false, so its coordinates are never sent to the public
 /// search.maven.org (#68/#733).
-fn url_is_maven_central(u: &str) -> bool {
-    u.contains("repo1.maven.org")
-        || u.contains("repo.maven.apache.org")
-        || u.contains("search.maven.org")
-        || u.contains("central.sonatype")
+fn url_is_maven_central(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && matches!(
+                url.host_str(),
+                Some("repo.maven.apache.org" | "repo1.maven.org")
+            )
+            && (url.path() == "/maven2" || url.path().starts_with("/maven2/"))
+    })
 }
 
-/// True when a configured Maven proxy points at Maven Central. Gates the search
-/// query so internal coordinates are never sent to search.maven.org.
-fn maven_upstream_is_central(state: &AppState) -> bool {
-    state
-        .config
-        .maven
-        .proxies
-        .iter()
-        .any(|p| url_is_maven_central(p.url()))
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CentralArtifactDate {
+    source: String,
+    digest: String,
+    timestamp: i64,
 }
 
-/// Best-effort upload timestamp for a Maven Central GAV via the Central search
-/// API. Maven's repo protocol exposes no per-artifact date, so this is the only
-/// source; any failure → `None` (the quarantine falls back to NORA's own clock).
+fn valid_release_timestamp(timestamp: i64) -> bool {
+    timestamp > 0 && timestamp <= chrono::Utc::now().timestamp()
+}
+
+fn date_key(path: &str, bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    format!(
+        ".nora-maven-dates/{}/{}.json",
+        hex::encode(sha2::Sha256::digest(path.as_bytes())),
+        hex::encode(digest)
+    )
+}
+
+fn valid_date_record(record: &CentralArtifactDate, path: &str, bytes: &[u8]) -> bool {
+    url_is_maven_central(&record.source)
+        && reqwest::Url::parse(&record.source).is_ok_and(|u| u.path() == format!("/maven2/{path}"))
+        && record.digest == hex::encode(sha2::Sha256::digest(bytes))
+        && valid_release_timestamp(record.timestamp)
+}
+
+/// Date evidence is bound to the exact bytes and Central URL, not just GAV.
+async fn cached_central_date(
+    state: &AppState,
+    path: &str,
+    bytes: &[u8],
+) -> Option<CentralArtifactDate> {
+    let bytes_record = state.storage.get(&date_key(path, bytes)).await.ok()?;
+    let record: CentralArtifactDate = serde_json::from_slice(&bytes_record).ok()?;
+    valid_date_record(&record, path, bytes).then_some(record)
+}
+
+/// A bounded fallback for an exact Central GAV; never trust the first search hit
+/// without matching every coordinate. Use the documented API, not UI endpoints.
 async fn fetch_maven_central_date(
     client: &reqwest::Client,
     group: &str,
@@ -273,28 +306,113 @@ async fn fetch_maven_central_date(
     version: &str,
     timeout_secs: u64,
 ) -> Option<i64> {
-    let url = format!(
-        "https://search.maven.org/solrsearch/select?q=g:%22{}%22+AND+a:%22{}%22+AND+v:%22{}%22&core=gav&rows=1&wt=json",
-        group, artifact, version
-    );
-    let resp = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
+    let response = client
+        .get("https://search.maven.org/solrsearch/select")
+        .query(&[
+            (
+                "q",
+                format!("g:\"{group}\" AND a:\"{artifact}\" AND v:\"{version}\""),
+            ),
+            ("core", "gav".into()),
+            ("rows", "1".into()),
+            ("wt", "json".into()),
+        ])
+        .timeout(Duration::from_secs(timeout_secs.min(2)))
         .send()
         .await
         .ok()?;
-    if !resp.status().is_success() {
+    if !response.status().is_success() {
         return None;
     }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let ts_ms = json
-        .get("response")?
-        .get("docs")?
-        .as_array()?
-        .first()?
-        .get("timestamp")?
-        .as_i64()?;
-    Some(ts_ms / 1000)
+    let json: serde_json::Value = response.json().await.ok()?;
+    matching_search_date(&json, group, artifact, version)
+}
+
+fn matching_search_date(
+    json: &serde_json::Value,
+    group: &str,
+    artifact: &str,
+    version: &str,
+) -> Option<i64> {
+    let entry = json.get("response")?.get("docs")?.as_array()?.first()?;
+    if entry.get("g")?.as_str()? != group
+        || entry.get("a")?.as_str()? != artifact
+        || entry.get("v")?.as_str()? != version
+    {
+        return None;
+    }
+    let timestamp = entry.get("timestamp")?.as_i64()? / 1000;
+    valid_release_timestamp(timestamp).then_some(timestamp)
+}
+
+async fn record_central_date(
+    state: &AppState,
+    path: &str,
+    bytes: &[u8],
+    source: &reqwest::Url,
+    headers: &reqwest::header::HeaderMap,
+    name: &str,
+    version: &str,
+) -> Option<CentralArtifactDate> {
+    if !url_is_maven_central(source.as_str()) || is_mutable_maven_path(path) {
+        return None;
+    }
+    let key = date_key(path, bytes);
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+    if let Some(record) = cached_central_date(state, path, bytes).await {
+        return Some(record);
+    }
+    let header_date = headers
+        .get(header::LAST_MODIFIED)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| chrono::DateTime::parse_from_rfc2822(h).ok())
+        .map(|d| d.timestamp())
+        .filter(|&t| valid_release_timestamp(t));
+    let timestamp = match header_date {
+        Some(date) => date,
+        None => {
+            let miss_key = format!("{key}.retry");
+            if let Ok(data) = state.storage.get(&miss_key).await {
+                if let Ok(previous) = serde_json::from_slice::<i64>(&data) {
+                    if (0..30).contains(&chrono::Utc::now().timestamp().saturating_sub(previous)) {
+                        return None;
+                    }
+                }
+            }
+            let (group, artifact) = name.split_once(':')?;
+            match fetch_maven_central_date(
+                &state.http_client_no_redirect,
+                group,
+                artifact,
+                version,
+                state.config.maven.proxy_timeout,
+            )
+            .await
+            {
+                Some(timestamp) => timestamp,
+                None => {
+                    // A transient search failure is retried after 30s, never a
+                    // permanent negative date. A good HTTP date bypasses it.
+                    if let Ok(data) = serde_json::to_vec(&chrono::Utc::now().timestamp()) {
+                        let _ = state.storage.put(&miss_key, &data).await;
+                    }
+                    return None;
+                }
+            }
+        }
+    };
+    let record = CentralArtifactDate {
+        source: source.as_str().to_string(),
+        digest: hex::encode(sha2::Sha256::digest(bytes)),
+        timestamp,
+    };
+    if !valid_date_record(&record, path, bytes) {
+        return None;
+    }
+    let data = serde_json::to_vec(&record).ok()?;
+    state.storage.create_internal(&key, &data).await.ok()?;
+    cached_central_date(state, path, bytes).await
 }
 
 // ============================================================================
@@ -349,44 +467,24 @@ async fn download(
         })
         .unwrap_or(false);
 
-    // Release date for the digest-quarantine first-seen clock (#748/#750), hoisted
-    // to function scope so the serve gate below can use it. Maven's repo layout
-    // exposes no per-artifact upload date, so for a Maven Central upstream we query
-    // the Central search API (gated to a Central proxy to avoid leaking coordinates);
-    // other proxies have no date (None → NORA's own clock). Hosted-only uses mtime.
-    //
-    // Consult Central for cached artifacts too: a cached file may predate the shared
-    // quarantine record, and release-age curation also requires the actual date.
     let cached_meta = state.storage.stat(&key).await;
-    let publish_date: Option<i64> =
-        if let Some((ref maven_name, ref maven_version)) = curation_coords {
-            if state.config.maven.proxies.is_empty() {
-                crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
-            } else if !internal
-                && state.config.server.trust_upstream_dates
-                && maven_upstream_is_central(&state)
-            {
-                // #68/#733: never send an internal-namespace GAV to the hardcoded public
-                // search.maven.org — that would leak operator-internal coordinates.
-                match maven_name.split_once(':') {
-                    Some((group, artifact)) => {
-                        fetch_maven_central_date(
-                            &state.http_client,
-                            group,
-                            artifact,
-                            maven_version,
-                            state.config.maven.proxy_timeout,
-                        )
-                        .await
-                    }
-                    None => None,
-                }
-            } else {
-                None
+    let (cached, read_failure) = crate::registry::cached_read(state.storage.get(&key).await);
+    // Warm downloads read only shared, digest-bound evidence. Unknown dates stay
+    // unknown; do not ask a search service about cached/private artifacts.
+    let trusted_date =
+        if !internal && state.config.server.trust_upstream_dates && !is_mutable_maven_path(&path) {
+            match cached.as_ref() {
+                Some(bytes) => cached_central_date(&state, &path, bytes).await,
+                None => None,
             }
         } else {
             None
         };
+    let publish_date = if state.config.maven.proxies.is_empty() {
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
+    } else {
+        trusted_date.as_ref().map(|r| r.timestamp)
+    };
 
     let cooldown_exempt = curation_coords.as_ref().is_some_and(|(name, version)| {
         state.curation().curation_engine.cooldown_exempt_version(
@@ -471,9 +569,6 @@ async fn download(
             }
         }
     }
-
-    // Read the cached artifact eagerly — kept for the freshness check and the stale-on-error fallback.
-    let (cached, read_failure) = crate::registry::cached_read(state.storage.get(&key).await);
 
     // maven-metadata.xml and SNAPSHOT artifacts are MUTABLE (rewritten as versions deploy); a
     // proxied mutable path must be revalidated against upstream unless within a positive
@@ -633,8 +728,14 @@ async fn download(
             .unwrap_or(&path);
         let url = format!("{}/{}", proxy.url().trim_end_matches('/'), upstream_path);
 
-        match proxy_fetch(
-            &state.http_client,
+        let trusted_origin = url_is_maven_central(proxy.url()) && proxy.auth().is_none();
+        let client = if trusted_origin && state.config.server.trust_upstream_dates {
+            &state.http_client_no_redirect
+        } else {
+            &state.http_client
+        };
+        match crate::registry::proxy_fetch_with_headers(
+            client,
             &url,
             Duration::from_secs(state.config.maven.proxy_timeout),
             proxy.auth().map(UpstreamAuth::Basic),
@@ -643,7 +744,43 @@ async fn download(
         )
         .await
         {
-            Ok(data) => {
+            Ok((data, response_headers, response_url)) => {
+                let trusted_date =
+                    if trusted_origin && state.config.server.trust_upstream_dates && !internal {
+                        match curation_coords.as_ref() {
+                            Some((name, version)) => {
+                                record_central_date(
+                                    &state,
+                                    &path,
+                                    &data,
+                                    &response_url,
+                                    &response_headers,
+                                    name,
+                                    version,
+                                )
+                                .await
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                let publish_date = trusted_date.as_ref().map(|r| r.timestamp);
+                if let Some((name, version)) = curation_coords.as_ref() {
+                    if !internal {
+                        if let Some(response) = crate::curation::check_download(
+                            &state.curation().curation_engine,
+                            state.bypass_token().as_deref(),
+                            &headers,
+                            RegistryType::Maven,
+                            name,
+                            crate::curation::RequestVersion::Known(version.clone()),
+                            publish_date,
+                        ) {
+                            return response;
+                        }
+                    }
+                }
                 // The allowlist's pinned integrity holds on the first download too, before anything is cached:
                 // the cache-hit branch checks the same rule.
                 if let Some((ref maven_name, ref maven_version)) = curation_coords {
@@ -1466,8 +1603,8 @@ mod tests {
         // canonical Central hosts → true (date source available)
         assert!(url_is_maven_central("https://repo1.maven.org/maven2"));
         assert!(url_is_maven_central("https://repo.maven.apache.org/maven2"));
-        assert!(url_is_maven_central("https://search.maven.org"));
-        assert!(url_is_maven_central("https://central.sonatype.com"));
+        assert!(!url_is_maven_central("https://search.maven.org"));
+        assert!(!url_is_maven_central("https://central.sonatype.com"));
         // private mirrors → false: their coordinates must NEVER reach search.maven.org (#68/#733)
         assert!(!url_is_maven_central(
             "https://nexus.internal.corp/repository/maven"
@@ -3277,5 +3414,158 @@ mod shared_maven_quarantine_regression {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod central_date_evidence_tests {
+    use super::*;
+    use crate::test_helpers::create_test_context_with_storage_and_config;
+
+    #[test]
+    fn only_canonical_https_release_origins_are_trusted() {
+        for url in [
+            "https://repo.maven.apache.org/maven2/",
+            "https://repo1.maven.org/maven2",
+        ] {
+            assert!(url_is_maven_central(url), "{url}");
+        }
+        for url in [
+            "https://repo.maven.apache.org.evil.test/maven2/",
+            "https://evil.test/repo1.maven.org/maven2/",
+            "http://repo1.maven.org/maven2/",
+            "https://user:secret@repo1.maven.org/maven2/",
+            "https://repo1.maven.org:444/maven2/",
+            "https://repo1.maven.org/private/",
+            "https://repo1.maven.org/maven2/?secret=x",
+            "https://central.sonatype.com/repository/maven-snapshots/",
+            "https://search.maven.org",
+        ] {
+            assert!(!url_is_maven_central(url), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_get_date_is_shared_and_bound_to_exact_bytes_and_path() {
+        let storage = crate::Storage::in_memory();
+        let a = create_test_context_with_storage_and_config(storage.clone(), |_| {});
+        let b = create_test_context_with_storage_and_config(storage.clone(), |_| {});
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        let source =
+            reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}")).unwrap();
+        let bytes = b"the fetched artifact";
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 08 Nov 2023 22:49:27 GMT"),
+        );
+        let record = record_central_date(
+            &a.state,
+            path,
+            bytes,
+            &source,
+            &headers,
+            "org.example:demo",
+            "1.0",
+        )
+        .await
+        .unwrap();
+        assert_eq!(record.timestamp, 1699483767);
+        let cached = cached_central_date(&b.state, path, bytes).await.unwrap();
+        assert_eq!(cached.timestamp, record.timestamp);
+        assert!(cached_central_date(&b.state, path, b"different artifact")
+            .await
+            .is_none());
+        assert!(
+            cached_central_date(&b.state, "org/other/demo/1.0/demo-1.0.jar", bytes)
+                .await
+                .is_none()
+        );
+        assert!(!valid_date_record(&record, path, b"different artifact"));
+    }
+
+    #[tokio::test]
+    async fn proxy_fetch_preserves_headers_and_does_not_follow_untrusted_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/artifact.jar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", "Wed, 08 Nov 2023 22:49:27 GMT")
+                    .set_body_bytes(b"artifact".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                format!("{}/artifact.jar", upstream.uri()).as_str(),
+            ))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context();
+        let url = format!("{}/artifact.jar", upstream.uri());
+        let (bytes, headers, final_url) = crate::registry::proxy_fetch_with_headers(
+            &ctx.state.http_client_no_redirect,
+            &url,
+            Duration::from_secs(1),
+            None,
+            &ctx.state.circuit_breaker,
+            RegistryType::Maven,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"artifact");
+        assert_eq!(
+            headers[header::LAST_MODIFIED],
+            "Wed, 08 Nov 2023 22:49:27 GMT"
+        );
+        assert_eq!(final_url.as_str(), url);
+        assert!(crate::registry::proxy_fetch_with_headers(
+            &ctx.state.http_client_no_redirect,
+            &format!("{}/redirect", upstream.uri()),
+            Duration::from_secs(1),
+            None,
+            &ctx.state.circuit_breaker,
+            RegistryType::Maven
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn search_fallback_must_match_every_coordinate() {
+        let json = serde_json::json!({"response":{"docs":[{"g":"org.example","a":"demo","v":"1.0","timestamp":1699483767000i64}]}});
+        assert_eq!(
+            matching_search_date(&json, "org.example", "demo", "1.0"),
+            Some(1699483767)
+        );
+        for (g, a, v) in [
+            ("org.other", "demo", "1.0"),
+            ("org.example", "other", "1.0"),
+            ("org.example", "demo", "2.0"),
+        ] {
+            assert_eq!(matching_search_date(&json, g, a, v), None);
+        }
+    }
+
+    #[test]
+    fn bad_or_future_timestamp_evidence_is_not_used() {
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+        let bytes = b"artifact";
+        let mut record = CentralArtifactDate {
+            source: format!("https://repo1.maven.org/maven2/{path}"),
+            digest: hex::encode(sha2::Sha256::digest(bytes)),
+            timestamp: chrono::Utc::now().timestamp() + 3600,
+        };
+        assert!(!valid_date_record(&record, path, bytes));
+        record.timestamp = -1;
+        assert!(!valid_date_record(&record, path, bytes));
+        record.timestamp = 1699483767;
+        record.source = format!("https://private.example/repo1.maven.org/maven2/{path}");
+        assert!(!valid_date_record(&record, path, bytes));
     }
 }
