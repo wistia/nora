@@ -60,3 +60,11 @@ Unknown versions cannot match. Removing an entry restores ordinary cooldown
 evaluation without changing stored quarantine timestamps. RubyGems platform
 builds share their resolved release version; ambiguous artifacts require every
 identity to qualify. Configuration reload applies changes.
+
+## PyPI index and denial caching
+
+Successful anonymous PyPI project indexes use `Cache-Control: public, max-age=300, stale-while-revalidate=86400, stale-if-error=432000` and `Vary: Accept`. New versions can take five minutes to appear, and cached indexes can remain stale during an origin outage. Authenticated and private index responses are `private, no-store`; an incomplete local fallback is `no-store`.
+
+A PyPI minimum-release-age denial with a known release date uses `public, max-age=0, s-maxage=N`, where N is the lesser of 300 seconds and the remaining cooldown. A configured bypass token disables shared caching of these denials. Other denial rules do not receive this TTL. A newly added exemption can take up to five minutes to become visible through a cached denial.
+
+CloudFront must cache HTML and JSON separately by `Accept`, and must forward requests with `Authorization` or `X-Nora-Bypass-Token` to the origin without serving an anonymous cached response. Set the minimum TTL to zero and allow a maximum TTL long enough for the stale windows. Configure the 403 error-caching minimum TTL to zero: CloudFront otherwise uses the greater of that minimum and `s-maxage`, which can extend a denial beyond the release-age boundary. Verify these distribution settings and cache hits separately; response headers alone do not enable caching.
