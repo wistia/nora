@@ -355,17 +355,14 @@ async fn download(
     // the Central search API (gated to a Central proxy to avoid leaking coordinates);
     // other proxies have no date (None → NORA's own clock). Hosted-only uses mtime.
     //
-    // #754: the Central query only happens on a cache MISS. On a cache hit the digest
-    // is already recorded (quarantine `record` is idempotent → the date is ignored),
-    // so a cheap local stat skips the upstream round-trip — a cache hit never pays it.
+    // Consult Central for cached artifacts too: a cached file may predate the shared
+    // quarantine record, and release-age curation also requires the actual date.
     let cached_meta = state.storage.stat(&key).await;
-    let already_cached = cached_meta.is_some();
     let publish_date: Option<i64> =
         if let Some((ref maven_name, ref maven_version)) = curation_coords {
             if state.config.maven.proxies.is_empty() {
                 crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
-            } else if !already_cached
-                && !internal
+            } else if !internal
                 && state.config.server.trust_upstream_dates
                 && maven_upstream_is_central(&state)
             {
@@ -517,15 +514,21 @@ async fn download(
             // per version). maven-metadata.xml is mutable (curation_coords=None) —
             // never quarantine it or its digest would change forever.
             if curation_coords.is_some() {
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                    &state.storage,
                     &state.digest_store,
                     "maven",
                     data,
                     &q_mode,
                     q_secs,
                     "cache",
-                    publish_date,
-                ) {
+                    crate::digest_quarantine::first_seen_seed(
+                        state.config.server.trust_upstream_dates,
+                        publish_date,
+                    ),
+                )
+                .await
+                {
                     return resp;
                 }
             }
@@ -678,7 +681,6 @@ async fn download(
                             None => metadata,
                         }
                     } else {
-                        state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
                         Bytes::from(data.clone())
                     };
 
@@ -698,17 +700,26 @@ async fn download(
                             .as_deref()
                             .or(state.config.curation.quarantine_ttl.as_deref()),
                     );
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                        &state.storage,
                         &state.digest_store,
                         "maven",
                         &data,
                         &q_mode,
                         q_secs,
                         &url,
-                        publish_date,
-                    ) {
+                        crate::digest_quarantine::first_seen_seed(
+                            state.config.server.trust_upstream_dates,
+                            publish_date,
+                        ),
+                    )
+                    .await
+                    {
                         return resp;
                     }
+                }
+                if metadata_request.is_none() {
+                    state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
                 }
                 return with_content_type(&path, response_data).into_response();
             }
@@ -755,15 +766,21 @@ async fn download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+                &state.storage,
                 &state.digest_store,
                 "maven",
                 data,
                 &q_mode,
                 q_secs,
                 "cache-stale",
-                publish_date,
-            ) {
+                crate::digest_quarantine::first_seen_seed(
+                    state.config.server.trust_upstream_dates,
+                    publish_date,
+                ),
+            )
+            .await
+            {
                 return resp;
             }
         }
@@ -3151,5 +3168,43 @@ mod maven_version_metadata_identity {
                 resp.status()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_maven_quarantine_regression {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn cached_artifact_is_held_consistently_across_replicas() {
+        let storage = crate::Storage::in_memory();
+        storage
+            .put("maven/org/example/demo/1.0/demo-1.0.pom", b"same artifact")
+            .await
+            .unwrap();
+        let config = |cfg: &mut crate::config::Config| {
+            cfg.maven.proxies.clear();
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+        };
+        let first = create_test_context_with_storage_and_config(storage.clone(), config);
+        let second = create_test_context_with_storage_and_config(storage.clone(), config);
+        let uri = "/maven2/org/example/demo/1.0/demo-1.0.pom";
+        let (a, b) = tokio::join!(
+            send(&first.app, Method::GET, uri, ""),
+            send(&second.app, Method::GET, uri, "")
+        );
+        assert_eq!(a.status(), StatusCode::FORBIDDEN);
+        assert_eq!(b.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            storage
+                .list_internal(".nora-quarantine/maven/")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
