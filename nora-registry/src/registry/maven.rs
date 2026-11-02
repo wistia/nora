@@ -1416,12 +1416,10 @@ fn with_content_type(
 ) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
     let content_type = maven_content_type(path);
 
-    // maven-metadata.xml is mutable; release artifacts are immutable
-    let cache_control = if ends_with_ci(path, "maven-metadata.xml")
-        || ends_with_ci(path, "maven-metadata.xml.sha1")
-        || ends_with_ci(path, "maven-metadata.xml.md5")
-    {
-        "public, max-age=60, must-revalidate"
+    // Mutable XML and independently fetched checksums cannot safely share long
+    // cache windows: an edge can otherwise mix generations during revalidation.
+    let cache_control = if is_mutable_maven_path(path) {
+        "no-store"
     } else {
         "public, max-age=31536000, immutable"
     };
@@ -1443,6 +1441,25 @@ fn with_content_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutable_maven_metadata_and_all_sidecars_are_not_stored() {
+        for suffix in ["", ".md5", ".sha1", ".sha256", ".sha512"] {
+            for base in [
+                "org/example/demo/maven-metadata.xml",
+                "org/example/demo/1.0-SNAPSHOT/maven-metadata.xml",
+            ] {
+                let (_, headers, _) =
+                    with_content_type(&format!("{base}{suffix}"), Bytes::from_static(b"data"));
+                assert_eq!(headers[1].1, "no-store");
+            }
+        }
+        let (_, headers, _) = with_content_type(
+            "org/example/demo/1.0-SNAPSHOT/demo-1.0-SNAPSHOT.jar",
+            Bytes::from_static(b"data"),
+        );
+        assert_eq!(headers[1].1, "no-store");
+    }
 
     #[test]
     fn test_url_is_maven_central() {
