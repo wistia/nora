@@ -527,7 +527,8 @@ async fn download_file(
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "pypi", ""));
 
-        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_shared(
+            &state.storage,
             &state.digest_store,
             "pypi",
             &data,
@@ -538,7 +539,9 @@ async fn download_file(
                 state.config.server.trust_upstream_dates,
                 publish_date,
             ),
-        ) {
+        )
+        .await
+        {
             return resp;
         }
 
@@ -673,6 +676,27 @@ async fn download_file(
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "proxy", "", "pypi", ""));
 
+                let quarantine = crate::digest_quarantine::proxy_gate_shared(
+                    &state.storage,
+                    &state.digest_store,
+                    "pypi",
+                    &data,
+                    &q_mode,
+                    q_secs,
+                    &file_url,
+                    crate::digest_quarantine::first_seen_seed(
+                        state.config.server.trust_upstream_dates,
+                        publish_date,
+                    ),
+                )
+                .await;
+                let quarantine = match quarantine {
+                    Some(response) if response.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                        return response
+                    }
+                    other => other,
+                };
+
                 // Cache in background + compute hash, invalidate AFTER write
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
@@ -690,21 +714,9 @@ async fn download_file(
                     }
                 });
 
-                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
-                    &state.digest_store,
-                    "pypi",
-                    &data,
-                    &q_mode,
-                    q_secs,
-                    &file_url,
-                    crate::digest_quarantine::first_seen_seed(
-                        state.config.server.trust_upstream_dates,
-                        publish_date,
-                    ),
-                ) {
+                if let Some(resp) = quarantine {
                     return resp;
                 }
-
                 let content_type = pypi_content_type(&filename);
                 return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
                     .into_response();
@@ -2343,6 +2355,176 @@ mod integration_tests {
             );
             assert_eq!(response.headers()[axum::http::header::VARY], "Accept");
         }
+    }
+
+    #[tokio::test]
+    async fn cold_fetch_records_shared_quarantine_before_cached_bytes() {
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/demo/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<a href=\"/file/demo-1.0.tar.gz\">demo-1.0.tar.gz</a>"),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/demo-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cold bytes".to_vec()))
+            .mount(&upstream)
+            .await;
+        let storage = crate::Storage::in_memory();
+        let context = || {
+            let uri = upstream.uri();
+            create_test_context_with_storage_and_config(storage.clone(), move |cfg| {
+                cfg.pypi.proxy = Some(uri);
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("7d".into());
+            })
+        };
+        let first = context();
+        let path = "/pypi/simple/demo/demo-1.0.tar.gz";
+        assert_eq!(
+            send(&first.app, Method::GET, path, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            storage
+                .list_internal(".nora-quarantine/pypi/")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for _ in 0..100 {
+            if storage.get("pypi/demo/demo-1.0.tar.gz").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(storage.get("pypi/demo/demo-1.0.tar.gz").await.is_ok());
+        let second = context();
+        assert_eq!(
+            send(&second.app, Method::GET, path, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_quarantine_is_used_on_cached_downloads_across_replicas() {
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        let storage = crate::Storage::in_memory();
+        storage
+            .put("pypi/demo/demo-1.0.tar.gz", b"shared artifact")
+            .await
+            .unwrap();
+        let context = || {
+            create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("7d".into());
+            })
+        };
+        let a = context();
+        let b = context();
+        let path = "/pypi/simple/demo/demo-1.0.tar.gz";
+        let (first, second) = tokio::join!(
+            send(&a.app, Method::GET, path, ""),
+            send(&b.app, Method::GET, path, "")
+        );
+        assert_eq!(first.status(), StatusCode::FORBIDDEN);
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
+        let keys = storage
+            .list_internal(".nora-quarantine/pypi/")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        let restarted = context();
+        assert_eq!(
+            send(&restarted.app, Method::GET, path, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_old_date_seeds_shared_quarantine_across_replicas() {
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        let storage = crate::Storage::in_memory();
+        storage
+            .put("pypi/demo/demo-1.0.tar.gz", b"old artifact")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "pypi/demo/dates.json",
+                br#"{"demo-1.0.tar.gz":"2020-01-01T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        let context = || {
+            create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+                cfg.server.trust_upstream_dates = true;
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.quarantine_ttl = Some("7d".into());
+            })
+        };
+        let a = context();
+        let b = context();
+        let path = "/pypi/simple/demo/demo-1.0.tar.gz";
+        assert_eq!(
+            send(&a.app, Method::GET, path, "").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&b.app, Method::GET, path, "").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            storage
+                .list_internal(".nora-quarantine/pypi/")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_shared_quarantine_fails_closed_on_cached_download() {
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        use sha2::Digest;
+        let storage = crate::Storage::in_memory();
+        let bytes = b"corrupt ledger artifact";
+        storage
+            .put("pypi/demo/demo-1.0.tar.gz", bytes)
+            .await
+            .unwrap();
+        let key = format!(
+            ".nora-quarantine/pypi/{}.json",
+            hex::encode(sha2::Sha256::digest(bytes))
+        );
+        storage.create_internal(&key, b"invalid").await.unwrap();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".into());
+        });
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/pypi/simple/demo/demo-1.0.tar.gz",
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
