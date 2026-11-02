@@ -399,6 +399,20 @@ async fn fetch_maven_search_date(
         return Err(DateLookupUnavailable);
     }
     let json: serde_json::Value = response.json().await.map_err(|_| DateLookupUnavailable)?;
+    // A transport-successful error or malformed Solr envelope is unavailable,
+    // not an authoritative lookup with no matching version. Keep empty docs and
+    // nonmatching coordinates on the successful unknown-date path.
+    if json.get("error").is_some()
+        || json.get("responseHeader").is_some_and(|header| {
+            header.get("status").and_then(serde_json::Value::as_i64) != Some(0)
+        })
+        || !json
+            .get("response")
+            .and_then(|response| response.get("docs"))
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err(DateLookupUnavailable);
+    }
     Ok(matching_search_date(&json, group, artifact, version))
 }
 
@@ -591,10 +605,14 @@ async fn download(
         && !cooldown_exempt
         && state.config.server.trust_upstream_dates
         && !is_mutable_maven_path(&path)
-        && (state
+        && ((state
             .curation()
             .curation_engine
             .reads_release_date(RegistryType::Maven)
+            && !crate::curation::has_valid_bypass_token(
+                state.bypass_token().as_deref(),
+                &headers,
+            ))
             || !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off));
     let cached_meta = state.storage.stat(&key).await;
     let early_read = if reads_evidence {
@@ -3936,6 +3954,129 @@ mod central_date_evidence_tests {
     }
 
     #[tokio::test]
+    async fn bypassed_ranges_skip_date_reads_but_keep_age_and_quarantine_enforcement() {
+        use crate::config::CurationMode;
+        use crate::digest_quarantine::QuarantineMode;
+        use crate::test_helpers::{body_bytes, send_with_headers};
+        use axum::http::Method;
+
+        for (mode, token, quarantine, expected_status, expected_full_reads) in [
+            (
+                CurationMode::Enforce,
+                Some("secret"),
+                QuarantineMode::Off,
+                StatusCode::PARTIAL_CONTENT,
+                0,
+            ),
+            (
+                CurationMode::Enforce,
+                Some("wrong"),
+                QuarantineMode::Off,
+                StatusCode::FORBIDDEN,
+                1,
+            ),
+            (
+                CurationMode::Enforce,
+                None,
+                QuarantineMode::Off,
+                StatusCode::FORBIDDEN,
+                1,
+            ),
+            (
+                CurationMode::Enforce,
+                Some("secret"),
+                QuarantineMode::Enforce,
+                StatusCode::FORBIDDEN,
+                1,
+            ),
+            (
+                CurationMode::Audit,
+                Some("secret"),
+                QuarantineMode::Off,
+                StatusCode::PARTIAL_CONTENT,
+                0,
+            ),
+            (
+                CurationMode::Audit,
+                None,
+                QuarantineMode::Off,
+                StatusCode::OK,
+                1,
+            ),
+            (
+                CurationMode::Audit,
+                Some("secret"),
+                QuarantineMode::Enforce,
+                StatusCode::FORBIDDEN,
+                1,
+            ),
+        ] {
+            let backend = EvidenceTestStore::new();
+            let storage = crate::Storage::from_backend(backend.clone());
+            let ctx = create_test_context_with_storage_and_config(storage.clone(), |cfg| {
+                cfg.maven.proxies = serde_json::from_value(serde_json::json!([
+                    "https://repo.maven.apache.org/maven2"
+                ]))
+                .unwrap();
+                cfg.server.trust_upstream_dates = true;
+                cfg.curation.mode = mode;
+                cfg.curation.min_release_age = Some("7d".into());
+                cfg.curation.bypass_token = Some("secret".into());
+                cfg.curation.quarantine = Some(quarantine);
+                cfg.curation.quarantine_ttl = Some("7d".into());
+            });
+            let path = "org/example/demo/1.0/demo-1.0.jar";
+            let bytes = b"0123456789";
+            let source =
+                reqwest::Url::parse(&format!("https://repo.maven.apache.org/maven2/{path}"))
+                    .unwrap();
+            let mut date_headers = reqwest::header::HeaderMap::new();
+            let young_date = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc2822();
+            date_headers.insert(
+                header::LAST_MODIFIED,
+                HeaderValue::from_str(&young_date).unwrap(),
+            );
+            record_central_date(
+                &ctx.state,
+                path,
+                bytes,
+                &source,
+                &date_headers,
+                "org.example:demo",
+                "1.0",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            storage.put(&storage_key(path), bytes).await.unwrap();
+            let mut request_headers = vec![("range", "bytes=2-4")];
+            if let Some(token) = token {
+                request_headers.push(("x-nora-bypass-token", token));
+            }
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                &format!("/maven2/{path}"),
+                request_headers,
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), expected_status);
+            if expected_status == StatusCode::PARTIAL_CONTENT {
+                assert_eq!(body_bytes(response).await.as_ref(), b"234");
+            }
+            assert_eq!(
+                backend.full_reads.load(Ordering::SeqCst),
+                expected_full_reads
+            );
+            assert_eq!(
+                backend.range_reads.load(Ordering::SeqCst),
+                usize::from(expected_status == StatusCode::PARTIAL_CONTENT)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn lookup_failures_are_retryable_but_empty_results_are_unknown() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -3962,20 +4103,53 @@ mod central_date_evidence_tests {
             .await
             .is_err());
         }
-        server.reset().await;
-        Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"response": {"docs": []}})),
-            )
-            .mount(&server)
-            .await;
-        assert!(
-            fetch_maven_search_date(&client, &server.uri(), "org.example", "demo", "1.0", 1)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        for body in [
+            serde_json::json!({"error": {"msg": "search unavailable"}}),
+            serde_json::json!({"error": {"msg": "search unavailable"}, "response": {"docs": []}}),
+            serde_json::json!({}),
+            serde_json::json!({"response": null}),
+            serde_json::json!({"response": {}}),
+            serde_json::json!({"response": {"docs": null}}),
+            serde_json::json!({"response": {"docs": {}}}),
+            serde_json::json!({"responseHeader": {"status": 1}, "response": {"docs": []}}),
+            serde_json::json!({"responseHeader": {"status": "0"}, "response": {"docs": []}}),
+            serde_json::json!({"responseHeader": null, "response": {"docs": []}}),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+                .mount(&server)
+                .await;
+            assert!(
+                fetch_maven_search_date(&client, &server.uri(), "org.example", "demo", "1.0", 1)
+                    .await
+                    .is_err(),
+                "malformed search response must remain retryable: {body}"
+            );
+        }
+        for (body, expected) in [
+            (serde_json::json!({"response": {"docs": []}}), None),
+            (
+                serde_json::json!({"response": {"docs": [{"g": "org.other", "a": "demo", "v": "1.0", "timestamp": 1699483767000_i64}]}}),
+                None,
+            ),
+            (
+                serde_json::json!({"responseHeader": {"status": 0}, "response": {"docs": [{"g": "org.example", "a": "demo", "v": "1.0", "timestamp": 1699483767000_i64}]}}),
+                Some(1699483767),
+            ),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            assert_eq!(
+                fetch_maven_search_date(&client, &server.uri(), "org.example", "demo", "1.0", 1)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
         let response = date_lookup_unavailable_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "30");
