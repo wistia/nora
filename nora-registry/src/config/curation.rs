@@ -184,6 +184,19 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
     };
     let npm_component = |value: &str| component(value) && !value.starts_with(['.', '_']);
     let valid_name = match registry {
+        RegistryType::PyPI => {
+            name.len() <= 200
+                && component(name)
+                && name
+                    .bytes()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && name
+                    .bytes()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && !name.contains('~')
+        }
         RegistryType::Npm => {
             name.len() <= 214
                 && if let Some(scoped) = name.strip_prefix('@') {
@@ -226,6 +239,8 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"-._~+".contains(&b))
             }
+
+            RegistryType::PyPI => crate::curation::pep440_key(version).is_some(),
             RegistryType::Npm => crate::curation::npm_version_key(version).is_some(),
             RegistryType::Go => crate::curation::go_version_key(version).is_some(),
             RegistryType::Hex => crate::curation::pub_version_key(version).is_some(),
@@ -457,7 +472,7 @@ impl CurationConfig {
             if let Some(section) = self.registry_override(registry) {
                 for entry in &section.cooldown_exempt_versions {
                     if !valid_exempt_identity(registry, &entry.name, &entry.version) {
-                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex, gems or maven"));
+                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex, gems, maven or pypi"));
                     }
                 }
 
