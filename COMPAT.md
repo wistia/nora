@@ -14,7 +14,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
 | npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
 | Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
-| PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
+| PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy at `/pypi/simple/` |
 | Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
 | Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT`/`GET` (ETag, `If-Match`, `If-None-Match`) on every backend; upload verification via `Repr-Digest` (RFC 9530) |
 | RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented |

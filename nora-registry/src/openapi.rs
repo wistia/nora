@@ -675,7 +675,7 @@ pub async fn cargo_publish() {}
 /// PyPI Simple index
 #[utoipa::path(
     get,
-    path = "/simple/",
+    path = "/pypi/simple/",
     tag = "pypi",
     responses(
         (status = 200, description = "HTML list of packages"),
@@ -687,7 +687,7 @@ pub async fn pypi_simple() {}
 /// PyPI package page
 #[utoipa::path(
     get,
-    path = "/simple/{name}/",
+    path = "/pypi/simple/{name}/",
     tag = "pypi",
     params(
         ("name" = String, Path, description = "Package name")
@@ -705,7 +705,7 @@ pub async fn pypi_package() {}
 /// Accepts a multipart form upload (twine-compatible).
 #[utoipa::path(
     post,
-    path = "/simple/",
+    path = "/pypi/simple/",
     tag = "pypi",
     responses(
         (status = 200, description = "Package uploaded"),

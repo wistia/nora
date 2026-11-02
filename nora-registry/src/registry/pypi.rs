@@ -4,10 +4,10 @@
 //! PyPI registry — PEP 503 (Simple HTML) + PEP 691 (JSON) + twine upload.
 //!
 //! Implements:
-//!   GET  /simple/                     — package index (HTML or JSON)
-//!   GET  /simple/{name}/              — package versions (HTML or JSON)
-//!   GET  /simple/{name}/{filename}    — download file
-//!   POST /simple/                     — twine upload (multipart/form-data)
+//!   GET  /pypi/simple/                     — package index (HTML or JSON)
+//!   GET  /pypi/simple/{name}/              — package versions (HTML or JSON)
+//!   GET  /pypi/simple/{name}/{filename}    — download file
+//!   POST /pypi/simple/                     — twine upload (multipart/form-data)
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -40,20 +40,20 @@ const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/simple/",
+            "/pypi/simple/",
             get(list_packages)
                 .post(upload)
                 .fallback(|| async { method_not_allowed("GET, POST") }),
         )
-        .route("/simple/{name}/", get(package_versions))
-        .route("/simple/{name}/{filename}", get(download_file))
+        .route("/pypi/simple/{name}/", get(package_versions))
+        .route("/pypi/simple/{name}/{filename}", get(download_file))
 }
 
 // ============================================================================
 // Package index
 // ============================================================================
 
-/// GET /simple/ — list all packages (PEP 503 HTML or PEP 691 JSON).
+/// GET /pypi/simple/ — list all packages (PEP 503 HTML or PEP 691 JSON).
 async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let keys = match state.storage.list("pypi/").await {
         Ok(k) => k,
@@ -102,7 +102,7 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
         for pkg in pkg_list {
             let _ = writeln!(
                 html,
-                "<a href=\"/simple/{}/\">{}</a><br>",
+                "<a href=\"/pypi/simple/{}/\">{}</a><br>",
                 html_escape(&pkg),
                 html_escape(&pkg)
             );
@@ -121,7 +121,7 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
 // Package versions
 // ============================================================================
 
-/// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
+/// GET /pypi/simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
 ///
 /// When proxy is configured, always fetches the upstream index and merges with
 /// locally cached/uploaded files. This ensures pip sees all available wheels
@@ -350,7 +350,7 @@ async fn package_versions(
 // Download
 // ============================================================================
 
-/// GET /simple/{name}/{filename} — download a specific file.
+/// GET /pypi/simple/{name}/{filename} — download a specific file.
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn download_file(
     State(state): State<AppState>,
@@ -707,10 +707,10 @@ async fn download_file(
 }
 
 // ============================================================================
-// Twine upload (PEP 503 — POST /simple/)
+// Twine upload (PEP 503 — POST /pypi/simple/)
 // ============================================================================
 
-/// POST /simple/ — upload a package via twine.
+/// POST /pypi/simple/ — upload a package via twine.
 ///
 /// twine sends multipart/form-data with fields:
 ///   :action = "file_upload"
@@ -939,7 +939,7 @@ fn versions_json_response(
             let (size, upload_time) = pep700.get(&f.filename).cloned().unwrap_or((None, None));
             Pep691File {
                 filename: f.filename.clone(),
-                url: format!("{}/simple/{}/{}", base, normalized, f.filename),
+                url: format!("{}/pypi/simple/{}/{}", base, normalized, f.filename),
                 hashes: Pep691Hashes {
                     sha256: f.sha256.clone(),
                 },
@@ -1004,7 +1004,7 @@ fn version_from_filename(filename: &str) -> Option<String> {
 /// already-loaded `dates.json` map.
 ///
 /// #969: this used to `stat()` every merged file — one HEAD per file on S3, issued
-/// serially, so `/simple/{name}/` cost N round-trips against a proxied index of N
+/// serially, so `/pypi/simple/{name}/` cost N round-trips against a proxied index of N
 /// upstream files and uv timed out. Both inputs are now gathered by the single
 /// listing and the single dates read the handler already performs, making this pure
 /// and O(N) in memory only. Upstream-only files have no local size (a `stat()` would
@@ -1042,7 +1042,7 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
             .unwrap_or_default();
         let _ = writeln!(
             html,
-            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
+            "<a href=\"{}/pypi/simple/{}/{}{}\">{}</a><br>",
             base,
             normalized,
             html_escape(&f.filename),
@@ -1109,7 +1109,7 @@ async fn pypi_publish_date(
 ///
 /// #969: an upstream that answers but emits no `upload-time` (any pre-PEP-700 index —
 /// devpi, Artifactory, an older NORA) used to leave nothing cached, so every single
-/// `/simple/{name}/` JSON request re-downloaded the whole upstream JSON index. An
+/// `/pypi/simple/{name}/` JSON request re-downloaded the whole upstream JSON index. An
 /// answered-but-dateless upstream is now recorded once, its files with null dates,
 /// and the refetch stops. A failed/open-breaker fetch still caches nothing, so a
 /// transient outage stays retryable.
@@ -2220,8 +2220,8 @@ mod integration_tests {
             .mount(&lists_nothing)
             .await;
         let refused = "http://127.0.0.1:9".to_string();
-        let index = "/simple/flask/";
-        let file = "/simple/flask/flask-2.0.tar.gz";
+        let index = "/pypi/simple/flask/";
+        let file = "/pypi/simple/flask/flask-2.0.tar.gz";
         for (upstreams, uri, want) in [
             (vec![down.uri()], index, StatusCode::BAD_GATEWAY),
             (vec![refused.clone()], index, StatusCode::BAD_GATEWAY),
@@ -2256,9 +2256,22 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_pypi_routes_are_prefixed() {
+        let ctx = create_test_context();
+        for path in [
+            "/simple/",
+            "/simple/flask/",
+            "/simple/flask/flask-2.0.tar.gz",
+        ] {
+            let response = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_pypi_list_empty() {
         let ctx = create_test_context();
-        let response = send(&ctx.app, Method::GET, "/simple/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/", "").await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
@@ -2276,12 +2289,12 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let response = send(&ctx.app, Method::GET, "/simple/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/", "").await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("flask"));
+        assert!(html.contains("href=\"/pypi/simple/flask/\""));
     }
 
     #[tokio::test]
@@ -2297,7 +2310,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/",
+            "/pypi/simple/",
             vec![("Accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -2320,14 +2333,14 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let response = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/flask/", "").await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("flask-2.0.tar.gz"));
         // URL should contain base_url + /simple/flask/flask-2.0.tar.gz
-        assert!(html.contains("/simple/flask/flask-2.0.tar.gz"));
+        assert!(html.contains("/pypi/simple/flask/flask-2.0.tar.gz"));
     }
 
     #[tokio::test]
@@ -2348,7 +2361,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let response = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/flask/", "").await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
@@ -2374,7 +2387,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/flask/",
+            "/pypi/simple/flask/",
             vec![("Accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -2470,7 +2483,7 @@ mod integration_tests {
             let response = send_with_headers(
                 &ctx.app,
                 Method::GET,
-                "/simple/flask/",
+                "/pypi/simple/flask/",
                 vec![("Accept", "application/vnd.pypi.simple.v1+json")],
                 "",
             )
@@ -2525,7 +2538,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/flask/",
+            "/pypi/simple/flask/",
             vec![("Accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -2567,7 +2580,13 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let response = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/flask/flask-2.0.tar.gz",
+            "",
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
@@ -2583,7 +2602,7 @@ mod integration_tests {
             .put("pypi/flask/flask-2.0.tar.gz", sdist)
             .await
             .unwrap();
-        let url = "/simple/flask/flask-2.0.tar.gz";
+        let url = "/pypi/simple/flask/flask-2.0.tar.gz";
 
         let resp =
             send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
@@ -2650,7 +2669,7 @@ mod integration_tests {
     async fn test_pypi_not_found_no_proxy() {
         let ctx = create_test_context();
 
-        let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/nonexistent/", "").await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -2682,7 +2701,7 @@ mod integration_tests {
             .unwrap();
 
         // HTML index must not contain dates.json
-        let response = send(&ctx.app, Method::GET, "/simple/loguru/", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/loguru/", "").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         let html = String::from_utf8_lossy(&body);
@@ -2699,7 +2718,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/loguru/",
+            "/pypi/simple/loguru/",
             vec![("Accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -2712,7 +2731,7 @@ mod integration_tests {
         assert_eq!(files[0]["filename"], "loguru-0.7.0.tar.gz");
     }
 
-    /// Regression test for #891 path 2: `GET /simple/{name}/dates.json` must
+    /// Regression test for #891 path 2: `GET /pypi/simple/{name}/dates.json` must
     /// return 404, not serve the internal bookkeeping file.
     #[tokio::test]
     async fn test_pypi_dates_json_not_downloadable() {
@@ -2727,7 +2746,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let response = send(&ctx.app, Method::GET, "/simple/loguru/dates.json", "").await;
+        let response = send(&ctx.app, Method::GET, "/pypi/simple/loguru/dates.json", "").await;
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
@@ -2755,9 +2774,9 @@ mod integration_tests {
             .put("pypi/pkg/weird.tar.gz", b"sdist")
             .await
             .unwrap();
-        let resp = send(&ctx.app, Method::GET, "/simple/pkg/weird.tar.gz", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/pkg/weird.tar.gz", "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let resp = send(&ctx.app, Method::GET, "/simple/pkg/", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/pkg/", "").await;
         assert_ne!(
             resp.status(),
             StatusCode::FORBIDDEN,
@@ -2810,7 +2829,7 @@ mod integration_tests {
         let _resp = send(
             &ctx.app,
             Method::GET,
-            "/simple/internal-secret/internal_secret-1.0.0.tar.gz",
+            "/pypi/simple/internal-secret/internal_secret-1.0.0.tar.gz",
             "",
         )
         .await;
@@ -2836,7 +2855,7 @@ mod integration_tests {
     /// #969 A/B: the simple JSON must take each file's PEP 700 `size` from the listing
     /// (`list_with_meta`) and NEVER `stat()` per file. On S3 a `stat()` is a HEAD
     /// round-trip, and they were issued serially over the whole merged file list, so
-    /// `/simple/{name}/` cost one HEAD per file — hundreds to tens of thousands for a
+    /// `/pypi/simple/{name}/` cost one HEAD per file — hundreds to tens of thousands for a
     /// proxied index — and uv timed out. A backend that counts `stat()` proves the JSON
     /// index now issues ZERO of them while still emitting the correct size.
     /// Same class as #738 on the Docker index rebuild.
@@ -2943,7 +2962,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/flask/",
+            "/pypi/simple/flask/",
             vec![("Accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -2964,7 +2983,7 @@ mod integration_tests {
     }
 
     /// #969: an upstream that answers the PEP 691 JSON but carries no `upload-time`
-    /// (any pre-PEP-700 index) left nothing cached, so EVERY `/simple/{name}/` JSON
+    /// (any pre-PEP-700 index) left nothing cached, so EVERY `/pypi/simple/{name}/` JSON
     /// request re-downloaded the whole upstream JSON index. The answered-but-dateless
     /// result is now cached once; the second request must not fetch it again.
     #[tokio::test]
@@ -3001,7 +3020,7 @@ mod integration_tests {
             let response = send_with_headers(
                 &ctx.app,
                 Method::GET,
-                "/simple/flask/",
+                "/pypi/simple/flask/",
                 vec![("Accept", "application/vnd.pypi.simple.v1+json")],
                 "",
             )
@@ -3070,7 +3089,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/flask/",
+            "/pypi/simple/flask/",
             vec![("Accept", PEP691_JSON)],
             "",
         )
@@ -3106,7 +3125,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/flask/",
+            "/pypi/simple/flask/",
             vec![("Accept", "application/vnd.pypi.simple.v1+json")],
             "",
         )
@@ -3159,7 +3178,7 @@ mod integration_tests {
         let response = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/flask/",
+            "/pypi/simple/flask/",
             vec![("Accept", PEP691_JSON)],
             "",
         )
@@ -3223,7 +3242,7 @@ mod integration_tests {
             let response = send_with_headers(
                 &ctx.app,
                 Method::GET,
-                "/simple/pkg/",
+                "/pypi/simple/pkg/",
                 vec![("Accept", PEP691_JSON)],
                 "",
             )
@@ -3247,7 +3266,7 @@ mod integration_tests {
 
     // ── A name with an empty segment never names another key's file ─────────
 
-    /// A project name is one segment: `/simple/evilpkg%2F/...` decodes to `evilpkg/` and
+    /// A project name is one segment: `/pypi/simple/evilpkg%2F/...` decodes to `evilpkg/` and
     /// `%2Fevilpkg` to `/evilpkg`, both naming the canonical file under a name the rule `evilpkg`
     /// does not cover — refused before curation and storage.
     #[tokio::test]
@@ -3273,7 +3292,7 @@ mod integration_tests {
         let canonical = send(
             &ctx.app,
             Method::GET,
-            "/simple/evilpkg/evilpkg-1.0.tar.gz",
+            "/pypi/simple/evilpkg/evilpkg-1.0.tar.gz",
             "",
         )
         .await;
@@ -3281,8 +3300,8 @@ mod integration_tests {
 
         let mut served = Vec::new();
         for alias in [
-            "/simple/evilpkg%2F/evilpkg-1.0.tar.gz",
-            "/simple/%2Fevilpkg/evilpkg-1.0.tar.gz",
+            "/pypi/simple/evilpkg%2F/evilpkg-1.0.tar.gz",
+            "/pypi/simple/%2Fevilpkg/evilpkg-1.0.tar.gz",
         ] {
             let resp = send(&ctx.app, Method::GET, alias, "").await;
             if resp.status() == StatusCode::OK {
@@ -3292,7 +3311,7 @@ mod integration_tests {
         assert!(served.is_empty(), "blocklisted file served: {served:?}");
     }
 
-    /// `/simple/%2Finternalpkg/` decodes to `/internalpkg`, which the isolation pattern
+    /// `/pypi/simple/%2Finternalpkg/` decodes to `/internalpkg`, which the isolation pattern
     /// `internal*` does not match: it is refused, and the index of an internal project is never
     /// requested from the public upstream.
     #[tokio::test]
@@ -3319,11 +3338,11 @@ mod integration_tests {
                 .filter(|r| r.url.path().contains("internalpkg"))
                 .count()
         };
-        let resp = send(&ctx.app, Method::GET, "/simple/internalpkg/", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/internalpkg/", "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
         assert_eq!(leaked().await, 0, "control: canonical name is not proxied");
 
-        let resp = send(&ctx.app, Method::GET, "/simple/%2Finternalpkg/", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/%2Finternalpkg/", "").await;
         assert_eq!(
             leaked().await,
             0,
@@ -3363,7 +3382,7 @@ mod integration_tests {
         let resp = send_with_headers(
             &ctx.app,
             Method::POST,
-            "/simple/",
+            "/pypi/simple/",
             vec![("content-type", ct.as_str())],
             body,
         )
@@ -3572,7 +3591,7 @@ mod spec_conformance_tests {
         for file in json["files"].as_array().unwrap() {
             let url = file["url"].as_str().unwrap();
             assert!(
-                url.starts_with("http://nora:4000/simple/"),
+                url.starts_with("http://nora:4000/pypi/simple/"),
                 "file URL must point to NORA base: {url}"
             );
         }
@@ -3602,11 +3621,11 @@ mod spec_conformance_tests {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
 
         assert!(
-            html.contains("http://nora:4000/simple/requests/requests-2.31.0.tar.gz"),
+            html.contains("http://nora:4000/pypi/simple/requests/requests-2.31.0.tar.gz"),
             "HTML must contain NORA URL for tarball"
         );
         assert!(
-            html.contains("http://nora:4000/simple/requests/requests-2.31.0-py3-none-any.whl"),
+            html.contains("http://nora:4000/pypi/simple/requests/requests-2.31.0-py3-none-any.whl"),
             "HTML must contain NORA URL for wheel"
         );
         // No upstream host leak
@@ -3750,7 +3769,7 @@ mod local_index_cost_tests {
         let resp = send_with_headers(
             &ctx.app,
             Method::POST,
-            "/simple/",
+            "/pypi/simple/",
             vec![("content-type", content_type.as_str())],
             body,
         )
@@ -3768,7 +3787,7 @@ mod local_index_cost_tests {
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/costpkg/",
+            "/pypi/simple/costpkg/",
             vec![("Accept", accept)],
             "",
         )
@@ -3831,7 +3850,7 @@ mod hash_marker_tests {
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            &format!("/simple/{project}/"),
+            &format!("/pypi/simple/{project}/"),
             vec![("Accept", "text/html")],
             "",
         )
@@ -3995,7 +4014,7 @@ mod hash_marker_tests {
         let resp = send_with_headers(
             &ctx.app,
             Method::POST,
-            "/simple/",
+            "/pypi/simple/",
             vec![("content-type", content_type.as_str())],
             upload_body("reup", "1.0", filename, b"current bytes"),
         )
@@ -4049,7 +4068,7 @@ mod hash_marker_tests {
         let resp = send(
             &ctx.app,
             Method::GET,
-            &format!("/simple/proxied/{filename}"),
+            &format!("/pypi/simple/proxied/{filename}"),
             "",
         )
         .await;
@@ -4096,7 +4115,7 @@ mod hash_marker_tests {
             let resp = send_with_headers(
                 &ctx.app,
                 Method::GET,
-                "/simple/sidecar/",
+                "/pypi/simple/sidecar/",
                 vec![("Accept", "text/html")],
                 "",
             )
@@ -4138,7 +4157,13 @@ mod upstream_failure_cases {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
         });
-        let resp = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/pypi/simple/flask/flask-2.0.tar.gz",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(!missing.received_requests().await.unwrap().is_empty());
     }
@@ -4167,7 +4192,7 @@ mod upstream_failure_cases {
         ctx.state
             .circuit_breaker
             .record_failure(&key, ProbeToken::BACKGROUND);
-        for uri in ["/simple/flask/flask-2.0.tar.gz", "/simple/flask/"] {
+        for uri in ["/pypi/simple/flask/flask-2.0.tar.gz", "/pypi/simple/flask/"] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
         }
@@ -4205,7 +4230,7 @@ mod upstream_failure_edge_cases {
                 .circuit_breaker
                 .record_failure(&key, ProbeToken::BACKGROUND);
         }
-        let resp = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/flask/", "").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!down.received_requests().await.unwrap().is_empty());
     }
@@ -4240,13 +4265,13 @@ mod empty_segment_requests {
             cfg.pypi.proxy = Some(up.uri());
             cfg.curation.internal_namespaces = vec!["internal*".to_string()];
         });
-        let control = "/simple/internalpkg/internalpkg-1.0.tar.gz";
+        let control = "/pypi/simple/internalpkg/internalpkg-1.0.tar.gz";
         let resp = send(&ctx.app, Method::GET, control, "").await;
         assert!(!resp.status().is_success(), "control");
         assert!(upstream_paths(&up).await.is_empty(), "control");
         for uri in [
-            "/simple/%2Finternalpkg/internalpkg-1.0.tar.gz",
-            "/simple/internalpkg%2F%2Fx/internalpkg-1.0.tar.gz",
+            "/pypi/simple/%2Finternalpkg/internalpkg-1.0.tar.gz",
+            "/pypi/simple/internalpkg%2F%2Fx/internalpkg-1.0.tar.gz",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -4267,7 +4292,7 @@ mod empty_segment_requests {
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/internalpkg/",
+            "/pypi/simple/internalpkg/",
             accept.clone(),
             Vec::new(),
         )
@@ -4277,7 +4302,7 @@ mod empty_segment_requests {
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/%2Finternalpkg/",
+            "/pypi/simple/%2Finternalpkg/",
             accept,
             Vec::new(),
         )
@@ -4300,13 +4325,13 @@ mod empty_segment_requests {
             cfg.curation.blocklist_path = Some(blocklist);
             cfg.curation.internal_namespaces = vec!["corp-secret".to_string()];
         });
-        let resp = send(&ctx.app, Method::GET, "/simple/corp-secret/", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/corp-secret/", "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
         assert!(upstream_paths(&up).await.is_empty(), "control");
         for uri in [
-            "/simple/corp-secret%2Fx/",
-            "/simple/corp-secret%2Fx/corp-secret-1.0.tar.gz",
-            "/simple/evilpkg%2Fevilpkg/evilpkg-1.0.tar.gz",
+            "/pypi/simple/corp-secret%2Fx/",
+            "/pypi/simple/corp-secret%2Fx/corp-secret-1.0.tar.gz",
+            "/pypi/simple/evilpkg%2Fevilpkg/evilpkg-1.0.tar.gz",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -4372,7 +4397,7 @@ mod name_normalization_properties {
         let resp = send_with_headers(
             &ctx.app,
             Method::POST,
-            "/simple/",
+            "/pypi/simple/",
             vec![("content-type", content_type.as_str())],
             body,
         )
@@ -4381,7 +4406,7 @@ mod name_normalization_properties {
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/foo-bar/",
+            "/pypi/simple/foo-bar/",
             vec![("accept", "text/html")],
             Vec::new(),
         )
@@ -4441,7 +4466,7 @@ mod blocked_version_in_any_sdist_spelling {
             let resp = send(
                 &ctx.app,
                 Method::GET,
-                &format!("/simple/python-dateutil/{file}"),
+                &format!("/pypi/simple/python-dateutil/{file}"),
                 "",
             )
             .await;
@@ -4451,7 +4476,7 @@ mod blocked_version_in_any_sdist_spelling {
         let resp = send(
             &ctx.app,
             Method::GET,
-            "/simple/python-dateutil/python-dateutil-2.8.1.tar.gz",
+            "/pypi/simple/python-dateutil/python-dateutil-2.8.1.tar.gz",
             "",
         )
         .await;
@@ -4514,11 +4539,23 @@ mod pep440_version_curation {
             "foo-2.0c1.tar.gz",
             "foo-v2.0rc1.tar.gz",
         ] {
-            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/pypi/simple/foo/{file}"),
+                "",
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
         }
         for file in ["foo-1.0.tar.gz", "foo-2.0.tar.gz", "foo-1.0.post2.tar.gz"] {
-            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/pypi/simple/foo/{file}"),
+                "",
+            )
+            .await;
             assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
         }
     }
@@ -4539,11 +4576,23 @@ mod pep440_version_curation {
             cfg.curation.allowlist_path = Some(allowlist);
         });
         for file in ["foo-1.0.tar.gz", "foo-1.0.0.tar.gz", "foo-v1.0.zip"] {
-            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/pypi/simple/foo/{file}"),
+                "",
+            )
+            .await;
             assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
         }
         for file in ["foo-1.1.tar.gz", "foo-1.0.post1.tar.gz"] {
-            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/pypi/simple/foo/{file}"),
+                "",
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
         }
     }
@@ -4633,15 +4682,20 @@ mod release_age_without_the_json_index {
         let index = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/simple/foo/",
+            "/pypi/simple/foo/",
             vec![("Accept", accept)],
             "",
         )
         .await;
         assert_eq!(index.status(), StatusCode::OK);
-        send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "")
-            .await
-            .status()
+        send(
+            &ctx.app,
+            Method::GET,
+            &format!("/pypi/simple/foo/{file}"),
+            "",
+        )
+        .await
+        .status()
     }
 
     /// `dates.json` as an earlier request cached it `days` ago.
@@ -4720,14 +4774,14 @@ mod release_age_without_the_json_index {
             let index = send_with_headers(
                 &ctx.app,
                 Method::GET,
-                "/simple/foo/",
+                "/pypi/simple/foo/",
                 vec![("Accept", PIP_HTML)],
                 "",
             )
             .await;
             assert_eq!(index.status(), StatusCode::OK);
             let before = json_listings(&up).await;
-            let _ = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
+            let _ = send(&ctx.app, Method::GET, "/pypi/simple/foo/foo-1.0.tar.gz", "").await;
             assert_eq!(json_listings(&up).await - before, want, "{name}");
         }
     }
@@ -4759,7 +4813,7 @@ mod release_age_without_the_json_index {
             let index = send_with_headers(
                 &ctx.app,
                 Method::GET,
-                "/simple/foo/",
+                "/pypi/simple/foo/",
                 vec![("Accept", PIP_HTML)],
                 "",
             )
@@ -4767,7 +4821,7 @@ mod release_age_without_the_json_index {
             assert_eq!(index.status(), StatusCode::OK);
             let before = json_listings(&up).await;
             assert_eq!(
-                send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+                send(&ctx.app, Method::GET, "/pypi/simple/foo/foo-1.0.tar.gz", "")
                     .await
                     .status(),
                 StatusCode::FORBIDDEN,
@@ -4852,7 +4906,7 @@ mod release_age_without_the_json_index {
             .await
             .unwrap();
         assert_eq!(
-            send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+            send(&ctx.app, Method::GET, "/pypi/simple/foo/foo-1.0.tar.gz", "")
                 .await
                 .status(),
             StatusCode::FORBIDDEN
@@ -4922,7 +4976,7 @@ mod release_age_without_the_json_index {
             .put("pypi/foo/foo-1.0.tar.gz", b"LOCAL")
             .await
             .unwrap();
-        let resp = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
+        let resp = send(&ctx.app, Method::GET, "/pypi/simple/foo/foo-1.0.tar.gz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(up.received_requests().await.unwrap().is_empty());
     }
@@ -4973,7 +5027,13 @@ mod upstream_index_digest {
     }
 
     async fn download(ctx: &TestContext) -> (StatusCode, Vec<u8>) {
-        let resp = send(&ctx.app, Method::GET, &format!("/simple/hm/{FILE}"), "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/pypi/simple/hm/{FILE}"),
+            "",
+        )
+        .await;
         let status = resp.status();
         (status, body_bytes(resp).await.to_vec())
     }

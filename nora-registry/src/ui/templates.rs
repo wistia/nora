@@ -1286,7 +1286,7 @@ pub fn render_package_detail(
         Some(RegistryType::Npm) => format!("npm install {} --registry {}/npm", name, base_url),
         Some(RegistryType::Cargo) => format!("cargo add {}", name),
         Some(RegistryType::PyPI) => {
-            format!("pip install {} --index-url {}/simple", name, base_url)
+            format!("pip install {} --index-url {}/pypi/simple", name, base_url)
         }
         Some(RegistryType::Go) => format!("GOPROXY={}/go go get {}", base_url, name),
         Some(RegistryType::Raw) => {
@@ -2226,7 +2226,7 @@ mod tests {
             false,
         );
         assert!(
-            html.contains("https://registry.example.com/simple"),
+            html.contains("https://registry.example.com/pypi/simple"),
             "PyPI install command must use public_url"
         );
         assert!(
@@ -2281,7 +2281,7 @@ mod tests {
         let html =
             render_package_detail("pypi", "flask", &empty_detail(), Lang::En, base_url, false);
         assert!(
-            html.contains("http://0.0.0.0:4000/simple"),
+            html.contains("http://0.0.0.0:4000/pypi/simple"),
             "Must use fallback host:port when public_url is not set"
         );
     }
@@ -2318,7 +2318,7 @@ mod tests {
         let base_url = "https://registry.example.com";
         let html = render_package_detail("pypi", "pkg", &empty_detail(), Lang::En, base_url, false);
         assert!(
-            !html.contains("com//simple"),
+            !html.contains("com//pypi/simple"),
             "Must not produce double slashes"
         );
     }

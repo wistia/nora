@@ -184,7 +184,7 @@ export const REGISTRIES: RegistryContract[] = [
       breadcrumbRootText: 'PyPI Repository',
       hasInstallCommand: true,
       installSectionLabel: 'Install Command',
-      installCommandPattern: /pip install .+ --index-url .+\/simple/,
+      installCommandPattern: /pip install .+ --index-url .+\/pypi\/simple/,
       tableColumnHeaders: ['Versions', 'Size', 'Published'],
       hasMetadataPanel: false,
       hasClickableVersionRows: false,

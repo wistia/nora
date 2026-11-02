@@ -73,7 +73,7 @@ docker push localhost:4000/myapp:latest
 npm config set registry http://localhost:4000/npm/
 
 # pip
-pip install --index-url http://localhost:4000/simple/ requests
+pip install --index-url http://localhost:4000/pypi/simple/ requests
 ```
 
 Every format has its own page with client setup, publishing and proxy options: [registries](https://getnora.dev/registries/docker/).

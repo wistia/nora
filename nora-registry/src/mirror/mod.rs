@@ -291,7 +291,7 @@ async fn mirror_lockfile(
 
     for target in &targets {
         let url = match format {
-            "pip" => format!("{}/simple/{}/", base, target.name),
+            "pip" => format!("{}/pypi/simple/{}/", base, target.name),
             "cargo" => format!(
                 "{}/cargo/api/v1/crates/{}/{}/download",
                 base, target.name, target.version
