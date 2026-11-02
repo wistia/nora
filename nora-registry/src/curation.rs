@@ -186,6 +186,29 @@ impl CurationEngine {
             })
     }
 
+    /// A metadata path can be an artifact index or a group plugin index.
+    /// Use the short TTL if an exemption could affect either interpretation.
+    pub fn has_maven_metadata_exemption(&self, group_path: &str, artifact_id: &str) -> bool {
+        let group = group_path.replace('/', ".");
+        let artifact_name = format!("{group}:{artifact_id}");
+        let group_name = if group.is_empty() {
+            artifact_id.to_string()
+        } else {
+            format!("{group}.{artifact_id}")
+        };
+        self.config
+            .maven
+            .cooldown_exempt_versions
+            .iter()
+            .any(|entry| {
+                entry.name == artifact_name
+                    || entry
+                        .name
+                        .split_once(':')
+                        .is_some_and(|(g, _)| g == group_name)
+            })
+    }
+
     pub fn has_cooldown_exempt_packages(&self, registry: RegistryType) -> bool {
         self.config
             .registry_override(registry)

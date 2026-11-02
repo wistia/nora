@@ -540,7 +540,7 @@ async fn download(
                     return resp;
                 }
             }
-            let mut response = with_content_type(&path, data.clone()).into_response();
+            let mut response = maven_response(&state, &path, data.clone());
             if !is_mutable_maven_path(&path) {
                 response
                     .headers_mut()
@@ -575,7 +575,7 @@ async fn download(
             if let Some(ref data) = cached {
                 state.metrics.record_download("maven");
                 state.metrics.record_cache_hit("maven");
-                return with_content_type(&path, data.clone()).into_response();
+                return maven_response(&state, &path, data.clone());
             }
             if let Some(e) = &read_failure {
                 return crate::registry::local_copy_unreadable("maven", &key, e);
@@ -595,7 +595,7 @@ async fn download(
         if let Some(ref data) = cached {
             state.metrics.record_download("maven");
             state.metrics.record_cache_hit("maven");
-            return with_content_type(&path, data.clone()).into_response();
+            return maven_response(&state, &path, data.clone());
         }
         if let Some(e) = &read_failure {
             return crate::registry::local_copy_unreadable("maven", &key, e);
@@ -729,7 +729,7 @@ async fn download(
                 if metadata_request.is_none() {
                     state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
                 }
-                return with_content_type(&path, response_data).into_response();
+                return maven_response(&state, &path, response_data);
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(e) => {
@@ -792,7 +792,12 @@ async fn download(
                 return resp;
             }
         }
-        let mut response = with_content_type(&path, data.clone()).into_response();
+        let mut response = maven_response(&state, &path, data.clone());
+        if is_mutable_maven_path(&path) {
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         response.headers_mut().insert(
             axum::http::header::HeaderName::from_static("x-nora-stale"),
             axum::http::header::HeaderValue::from_static("true"),
@@ -1410,6 +1415,38 @@ fn maven_content_type(path: &str) -> &'static str {
     }
 }
 
+fn maven_response(state: &AppState, path: &str, data: Bytes) -> Response {
+    let mut response = with_content_type(path, data).into_response();
+    if let MavenPathKind::ArtifactMeta {
+        group_path,
+        artifact_id,
+        ..
+    } = classify_path(path)
+    {
+        if is_snapshot(&artifact_id) {
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return response;
+        }
+        let engine = &state.curation().curation_engine;
+        let scoped = engine.has_maven_metadata_exemption(&group_path, &artifact_id);
+        let value = if scoped {
+            "public, max-age=300, stale-while-revalidate=86400, stale-if-error=432000"
+        } else {
+            "public, max-age=3600, stale-while-revalidate=86400, stale-if-error=432000"
+        };
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
+    } else if is_mutable_maven_path(path) {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
 fn with_content_type(
     path: &str,
     data: Bytes,
@@ -1443,6 +1480,51 @@ fn with_content_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maven_metadata_cache_policy_keeps_all_sidecars_consistent() {
+        let no_exempt = crate::test_helpers::create_test_context();
+        let exempt = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.curation.maven.cooldown_exempt_versions = vec![serde_json::from_value(
+                serde_json::json!({"name":"org.example:demo","version":"1.0"}),
+            )
+            .unwrap()];
+        });
+        for suffix in ["", ".md5", ".sha1", ".sha256", ".sha512"] {
+            let path = format!("org/example/demo/maven-metadata.xml{suffix}");
+            for (ctx, ttl) in [(&no_exempt, "max-age=3600"), (&exempt, "max-age=300")] {
+                let response = maven_response(&ctx.state, &path, Bytes::from_static(b"data"));
+                let policy = response.headers()[header::CACHE_CONTROL].to_str().unwrap();
+                assert!(policy.contains(ttl), "{path}: {policy}");
+                assert!(policy.contains("stale-while-revalidate=86400"));
+                assert!(policy.contains("stale-if-error=432000"));
+            }
+        }
+        let unrelated = maven_response(
+            &exempt.state,
+            "org/other/another/maven-metadata.xml",
+            Bytes::from_static(b"data"),
+        );
+        assert!(unrelated.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("max-age=3600"));
+        let group = maven_response(
+            &exempt.state,
+            "org/example/maven-metadata.xml",
+            Bytes::from_static(b"data"),
+        );
+        assert!(group.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("max-age=300"));
+        let response = maven_response(
+            &no_exempt.state,
+            "org/example/demo/1.0-SNAPSHOT/maven-metadata.xml",
+            Bytes::from_static(b"data"),
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
 
     #[test]
     fn test_url_is_maven_central() {
