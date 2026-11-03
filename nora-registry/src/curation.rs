@@ -228,6 +228,15 @@ impl CurationEngine {
                 .any(|filter| filter.reads_release_date(registry))
     }
 
+    /// Effective release-age threshold from the current (reloadable) configuration.
+    pub(crate) fn min_release_age_secs(&self, registry: RegistryType) -> Option<i64> {
+        self.config
+            .registry_override(registry)
+            .and_then(|own| own.min_release_age.as_deref())
+            .or(self.config.min_release_age.as_deref())
+            .and_then(|value| parse_duration(value).ok())
+    }
+
     /// Whether curation reads a download's name: it is on (audit logs what it would refuse),
     /// or a namespace filter is set (it runs even with curation off). A format that learns an
     /// alias's canonical name from its upstream, for curation to read, asks only when this

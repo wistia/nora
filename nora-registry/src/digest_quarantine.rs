@@ -506,8 +506,32 @@ pub async fn proxy_gate_shared(
     })
 }
 
-/// Release evidence is accepted only for bytes retrieved from a canonical Central
-/// artifact URL. The caller must additionally enable `trust_upstream_dates` and
+/// Match the exact configured origin and repository path; never accept credentials,
+/// query strings, sibling paths, or a redirect to a different origin.
+pub(crate) fn maven_proxy_artifact_path(upstream: &str, source: &str) -> Option<String> {
+    let base = reqwest::Url::parse(upstream).ok()?;
+    let source = reqwest::Url::parse(source).ok()?;
+    for url in [&base, &source] {
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+    }
+    if base.origin() != source.origin() {
+        return None;
+    }
+    source
+        .path()
+        .strip_prefix(&format!("{}/", base.path().trim_end_matches('/')))
+        .map(str::to_owned)
+}
+
+/// Release evidence is accepted for bytes retrieved from an explicitly configured Maven
+/// upstream artifact URL. The caller must additionally enable `trust_upstream_dates` and
 /// establish that the timestamp belongs to that response (or verified digest cache).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TrustedReleaseEvidence {
@@ -517,49 +541,62 @@ pub(crate) struct TrustedReleaseEvidence {
 }
 
 impl TrustedReleaseEvidence {
+    #[cfg(test)]
     pub(crate) fn maven_central(
         published_at: i64,
         artifact_url: &str,
         bytes: &[u8],
     ) -> Option<Self> {
-        use sha2::Digest;
         let url = reqwest::Url::parse(artifact_url).ok()?;
-        if published_at <= 0
-            || published_at > Utc::now().timestamp()
-            || url.scheme() != "https"
+        if url.scheme() != "https"
+            || url.port().is_some()
             || !matches!(
                 url.host_str(),
                 Some("repo.maven.apache.org" | "repo1.maven.org")
             )
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.port().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
         {
             return None;
         }
-        let artifact = url.path().strip_prefix("/maven2/")?;
-        if artifact.split('/').count() < 4
+        Self::maven_proxy(
+            published_at,
+            artifact_url,
+            bytes,
+            &format!("https://{}/maven2", url.host_str()?),
+        )
+    }
+
+    pub(crate) fn maven_proxy(
+        published_at: i64,
+        artifact_url: &str,
+        bytes: &[u8],
+        upstream: &str,
+    ) -> Option<Self> {
+        use sha2::Digest;
+        let artifact = maven_proxy_artifact_path(upstream, artifact_url)?;
+        if published_at <= 0
+            || published_at > Utc::now().timestamp()
+            || artifact.split('/').count() < 4
             || artifact
                 .split('/')
                 .any(|part| part.ends_with("-SNAPSHOT") || part.starts_with("maven-metadata.xml"))
             || artifact.ends_with('/')
             || artifact.contains('%')
-            || crate::validation::validate_storage_key(artifact).is_err()
+            || crate::validation::validate_storage_key(&artifact).is_err()
         {
             return None;
         }
         Some(Self {
             published_at,
-            artifact_url: url.to_string(),
+            artifact_url: artifact_url.to_owned(),
             digest: format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes))),
         })
     }
 
     fn matches_bytes(&self, bytes: &[u8]) -> bool {
-        Self::maven_central(self.published_at, &self.artifact_url, bytes)
-            .is_some_and(|validated| validated.digest == self.digest)
+        use sha2::Digest;
+        self.published_at > 0
+            && self.published_at <= Utc::now().timestamp()
+            && self.digest == format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
     }
 }
 
@@ -681,9 +718,17 @@ pub(crate) async fn proxy_gate_shared_recoverable(
         let Some(saved) = saved else { return Ok(first_seen); };
         let saved: TrustedReleaseEvidence = serde_json::from_slice(&saved).map_err(|e| e.to_string())?;
         if !saved.matches_bytes(bytes) {
-            return Err("trusted release evidence does not match artifact bytes or source".to_owned());
+            return Err("trusted release evidence does not match artifact bytes".to_owned());
         }
-        Ok(first_seen.min(saved.published_at))
+        // The observation is digest-keyed, so identical bytes may be reached at
+        // several legitimate artifact URLs. The caller independently validates
+        // current evidence against its configured upstreams. A different source
+        // must use its own date, never the saved source's potentially revoked date.
+        let published_at = match evidence {
+            Some(current) if current.artifact_url != saved.artifact_url => current.published_at,
+            _ => saved.published_at,
+        };
+        Ok(first_seen.min(published_at))
     }.await;
     let first_seen = match result {
         Ok(first_seen) => first_seen,
@@ -1576,6 +1621,67 @@ mod trusted_release_recovery_tests {
             evidence,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn identical_bytes_from_distinct_sources_recover_without_reusing_another_sources_date() {
+        let storage = crate::Storage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = DigestStore::empty(dir.path().to_str().unwrap());
+        let old = Utc::now().timestamp() - TTL - 60;
+        let a = TrustedReleaseEvidence::maven_central(old, URL, BYTES).unwrap();
+        let b_url = "https://packages.confluent.io/maven/org/example/other/1.0/other-1.0.jar";
+        let b = TrustedReleaseEvidence::maven_proxy(
+            old,
+            b_url,
+            BYTES,
+            "https://packages.confluent.io/maven",
+        )
+        .unwrap();
+        let (first, second) = tokio::join!(
+            gate(&storage, &local, true, Some(&a)),
+            gate(&storage, &local, true, Some(&b)),
+        );
+        assert!(first.is_none());
+        assert!(second.is_none());
+        assert!(gate(&storage, &local, true, Some(&a)).await.is_none());
+        assert!(gate(&storage, &local, true, Some(&b)).await.is_none());
+
+        // Whichever URL won the immutable saved evidence must not donate its old
+        // timestamp to a newly configured URL publishing the same bytes recently.
+        let (_, evidence_key) = keys();
+        storage
+            .put(&evidence_key, &serde_json::to_vec(&a).unwrap())
+            .await
+            .unwrap();
+        let recent = TrustedReleaseEvidence::maven_proxy(
+            Utc::now().timestamp() - 60,
+            b_url,
+            BYTES,
+            "https://packages.confluent.io/maven",
+        )
+        .unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&recent))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            gate(&storage, &local, true, None).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Independent current evidence does not make damaged shared state safe.
+        storage.put(&evidence_key, b"invalid JSON").await.unwrap();
+        assert_eq!(
+            gate(&storage, &local, true, Some(&b))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
