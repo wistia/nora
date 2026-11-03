@@ -19,6 +19,7 @@ name = "nora"
 path = "src/main.rs"
 
 [dependencies]
+semver = "1"
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true

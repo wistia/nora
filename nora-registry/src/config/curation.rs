@@ -164,11 +164,13 @@ pub struct RegistryCurationOverride {
     /// Override quarantine TTL for this specific registry.
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
-    /// Exact Hex or RubyGems package names exempt from release age and digest quarantine.
-    /// Only supported for Hex and Gems; other registry sections reject non-empty lists.
+    /// Exact Hex, RubyGems, or Cargo package names exempt from release age and digest quarantine.
+    /// Cargo names fold case and treat hyphens and underscores as equivalent.
+    /// Other registry sections reject non-empty lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_exempt_packages: Vec<String>,
     /// Literal npm scope or Go module path prefixes, including the trailing slash.
+    /// Cargo prefixes end in `-` or `_`, fold case, and equate hyphens and underscores.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_exempt_prefixes: Vec<String>,
 }
@@ -183,7 +185,16 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
                 .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
     };
     let npm_component = |value: &str| component(value) && !value.starts_with(['.', '_']);
+    let cargo_name = |name: &str| {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    };
     let valid_name = match registry {
+        RegistryType::Cargo => cargo_name(name),
         RegistryType::PyPI => {
             name.len() <= 200
                 && component(name)
@@ -240,6 +251,7 @@ fn valid_exempt_identity(registry: RegistryType, name: &str, version: &str) -> b
                         .all(|b| b.is_ascii_alphanumeric() || b"-._~+".contains(&b))
             }
 
+            RegistryType::Cargo => semver::Version::parse(version).is_ok(),
             RegistryType::PyPI => crate::curation::pep440_key(version).is_some(),
             RegistryType::Npm => crate::curation::npm_version_key(version).is_some(),
             RegistryType::Go => crate::curation::go_version_key(version).is_some(),
@@ -437,7 +449,18 @@ impl CurationConfig {
         let Some(section) = self.registry_override(registry) else {
             return false;
         };
-        (matches!(registry, RegistryType::Hex | RegistryType::Gems)
+        (registry == RegistryType::Cargo && {
+            let normalize = |value: &str| crate::curation::curation_name(registry, value);
+            let name = normalize(name);
+            section
+                .cooldown_exempt_packages
+                .iter()
+                .any(|p| normalize(p) == name)
+                || section
+                    .cooldown_exempt_prefixes
+                    .iter()
+                    .any(|p| !p.is_empty() && name.starts_with(&normalize(p)))
+        }) || (matches!(registry, RegistryType::Hex | RegistryType::Gems)
             && section.cooldown_exempt_packages.iter().any(|p| p == name))
             || (matches!(registry, RegistryType::Npm | RegistryType::Go)
                 && section
@@ -472,12 +495,21 @@ impl CurationConfig {
             if let Some(section) = self.registry_override(registry) {
                 for entry in &section.cooldown_exempt_versions {
                     if !valid_exempt_identity(registry, &entry.name, &entry.version) {
-                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex, gems, maven or pypi"));
+                        errors.push(format!("curation.{registry}.cooldown_exempt_versions requires exact names and versions for npm, go, hex, gems, maven, pypi or cargo"));
                     }
                 }
 
                 for prefix in &section.cooldown_exempt_prefixes {
                     let valid = match registry {
+                        RegistryType::Cargo => {
+                            prefix.len() > 1
+                                && prefix.len() <= 64
+                                && prefix.as_bytes()[0].is_ascii_alphanumeric()
+                                && prefix.ends_with(['-', '_'])
+                                && prefix
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                        }
                         RegistryType::Npm => prefix
                             .strip_prefix('@')
                             .and_then(|p| p.strip_suffix('/'))
@@ -504,11 +536,15 @@ impl CurationConfig {
                         _ => false,
                     };
                     if !valid {
-                        errors.push(format!("curation.{registry}.cooldown_exempt_prefixes: {prefix:?} must be a literal npm scope or Go module prefix ending in / (npm and go only)"));
+                        errors.push(format!("curation.{registry}.cooldown_exempt_prefixes: {prefix:?} must be a literal npm scope or Go module prefix ending in /, or a Cargo crate prefix ending in - or _"));
                     }
                 }
                 for name in &section.cooldown_exempt_packages {
-                    if registry == RegistryType::Gems {
+                    if registry == RegistryType::Cargo {
+                        if !valid_exempt_identity(registry, name, "1.0.0") {
+                            errors.push(format!("curation.cargo.cooldown_exempt_packages: invalid crate name {name:?}"));
+                        }
+                    } else if registry == RegistryType::Gems {
                         if name.is_empty()
                             || name.len() > 256
                             || name.contains("..")
@@ -519,7 +555,7 @@ impl CurationConfig {
                             errors.push(format!("curation.gems.cooldown_exempt_packages: {name:?} must be an exact RubyGems package name (no wildcards or paths)"));
                         }
                     } else if registry != RegistryType::Hex {
-                        errors.push(format!("curation.{registry}.cooldown_exempt_packages is only supported for hex and gems"));
+                        errors.push(format!("curation.{registry}.cooldown_exempt_packages is only supported for hex, gems and cargo"));
                     } else if name.is_empty()
                         || !name
                             .bytes()
@@ -853,5 +889,53 @@ mod exact_version_tests {
                 "{registry}: {name}@{version}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cargo_exemption_tests {
+    use super::*;
+
+    #[test]
+    fn cargo_exemption_scope_and_validation() {
+        let mut cfg = CurationConfig::default();
+        cfg.cargo.cooldown_exempt_prefixes = vec!["Wistia-".into()];
+        cfg.cargo.cooldown_exempt_packages = vec!["Exact-Crate".into()];
+        assert!(cfg.cooldown_exemption_errors().is_empty());
+        assert!(cfg.cooldown_exempt(RegistryType::Cargo, "wistia_tools"));
+        assert!(cfg.cooldown_exempt(RegistryType::Cargo, "exact_crate"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Cargo, "wistiaextra"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Cargo, "exact_crate_other"));
+        assert!(!cfg.cooldown_exempt(RegistryType::Gems, "wistia_tools"));
+        for prefix in ["", "wistia", "-", "w*/", "w/*", "w "] {
+            cfg.cargo.cooldown_exempt_prefixes = vec![prefix.into()];
+            assert!(!cfg.cooldown_exemption_errors().is_empty());
+        }
+        assert!(valid_exempt_identity(
+            RegistryType::Cargo,
+            "my-crate",
+            "1.0.0-rc.1+build"
+        ));
+        assert!(!valid_exempt_identity(
+            RegistryType::Cargo,
+            "my-crate",
+            "^1.0"
+        ));
+        assert!(!valid_exempt_identity(
+            RegistryType::Cargo,
+            "my/crate",
+            "1.0.0"
+        ));
+        cfg.cargo.cooldown_exempt_prefixes.clear();
+        cfg.cargo.cooldown_exempt_versions = vec![CooldownExemptVersion {
+            name: "only-crate".into(),
+            version: "1.0.0+build".into(),
+        }];
+        assert!(cfg.cooldown_exempt_version(
+            RegistryType::Cargo,
+            "ONLY_crate",
+            Some("1.0.0+build")
+        ));
+        assert!(!cfg.cooldown_exempt_version(RegistryType::Cargo, "only-crate", Some("1.0.0")));
     }
 }
