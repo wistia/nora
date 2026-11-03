@@ -2309,6 +2309,7 @@ dependencies = [
  "rsa",
  "rustix",
  "ruzstd",
+ "semver",
  "serde",
  "serde_ignored",
  "serde_json",

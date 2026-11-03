@@ -601,7 +601,14 @@ async fn download(
         state
             .audit
             .log(AuditEntry::new("pull", "proxy", "", "cargo", ""));
-        let (q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
+        let (mut q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
+        if state.curation().curation_engine.cooldown_exempt_version(
+            crate::registry_type::RegistryType::Cargo,
+            &crate_name,
+            Some(&version),
+        ) {
+            q_mode = crate::digest_quarantine::QuarantineMode::Off;
+        }
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "cargo",
@@ -718,7 +725,14 @@ async fn download(
             state
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "cargo", ""));
-            let (q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
+            let (mut q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
+            if state.curation().curation_engine.cooldown_exempt_version(
+                crate::registry_type::RegistryType::Cargo,
+                &crate_name,
+                Some(&version),
+            ) {
+                q_mode = crate::digest_quarantine::QuarantineMode::Off;
+            }
             if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "cargo",
@@ -5361,6 +5375,141 @@ mod quarantine_first_seen {
         });
         put_written_days_ago(&ctx, "cargo/oldcrate/metadata.json", METADATA, 30).await;
         (up, ctx)
+    }
+
+    #[tokio::test]
+    async fn cargo_exemptions_skip_cooldowns_on_fresh_and_cached_downloads() {
+        for scope in 0..4 {
+            for cached in [false, true] {
+                let up = MockServer::start().await;
+                serve(
+                    &up,
+                    "/api/v1/crates/old-crate/1.0.0/download",
+                    b"CRATE".to_vec(),
+                )
+                .await;
+                let uri = up.uri();
+                let ctx = create_test_context_with_config(move |cfg| {
+                    cfg.cargo.proxy = Some(uri);
+                    cfg.server.trust_upstream_dates = true;
+                    quarantine_7d(cfg);
+                    cfg.curation.min_release_age = Some("7d".into());
+                    match scope {
+                        0 => cfg.curation.cargo.cooldown_exempt_packages = vec!["old-crate".into()],
+                        1 => {
+                            cfg.curation.cargo.cooldown_exempt_versions =
+                                vec![serde_json::from_value(
+                                    serde_json::json!({"name":"old-crate", "version":"1.0.0"}),
+                                )
+                                .unwrap()]
+                        }
+                        2 => cfg.curation.cargo.cooldown_exempt_prefixes = vec!["OLD_".into()],
+                        _ => {}
+                    }
+                });
+                let metadata = serde_json::to_vec(&serde_json::json!({
+                    "crate": {"name": "old-crate"},
+                    "versions": [{"num": "1.0.0", "created_at": chrono::Utc::now().to_rfc3339()}]
+                }))
+                .unwrap();
+                put_written_days_ago(&ctx, "cargo/old-crate/metadata.json", &metadata, 0).await;
+                if cached {
+                    put_written_days_ago(
+                        &ctx,
+                        "cargo/old-crate/1.0.0/old-crate-1.0.0.crate",
+                        b"CRATE",
+                        0,
+                    )
+                    .await;
+                }
+                assert_eq!(
+                    status(&ctx, "/cargo/api/v1/crates/old-crate/1.0.0/download").await,
+                    if scope == 3 {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::OK
+                    },
+                    "scope={scope} cached={cached}"
+                );
+                if scope != 3 {
+                    crate::test_helpers::reload_curation(&ctx, |cfg| {
+                        cfg.curation.cargo.cooldown_exempt_packages.clear();
+                        cfg.curation.cargo.cooldown_exempt_versions.clear();
+                        cfg.curation.cargo.cooldown_exempt_prefixes.clear();
+                    });
+                    assert_eq!(
+                        status(&ctx, "/cargo/api/v1/crates/old-crate/1.0.0/download").await,
+                        StatusCode::FORBIDDEN
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cargo_exemption_removal_restores_existing_quarantine() {
+        let (_up, ctx) = context(false).await;
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
+        crate::test_helpers::reload_curation(&ctx, |cfg| {
+            cfg.curation.cargo.cooldown_exempt_packages = vec!["oldcrate".into()];
+        });
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+        crate::test_helpers::reload_curation(&ctx, |_| {});
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cargo_exemptions_preserve_blocklists_and_integrity() {
+        for cached in [false, true] {
+            for blocked in [false, true] {
+                let up = MockServer::start().await;
+                serve(
+                    &up,
+                    "/api/v1/crates/oldcrate/1.0.0/download",
+                    b"CRATE".to_vec(),
+                )
+                .await;
+                let (_blockdir, blockfile) =
+                    crate::test_helpers::blocklist_file("cargo", "oldcrate");
+                let dir = tempfile::TempDir::new().unwrap();
+                let allowfile = dir.path().join("allowlist.json");
+                std::fs::write(&allowfile, serde_json::to_vec(&serde_json::json!({"version":1,"entries":[{
+                    "registry":"cargo", "name":"oldcrate", "version":"1.0.0",
+                    "integrity":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "integrity_source":"manual"
+                }]})).unwrap()).unwrap();
+                let uri = up.uri();
+                let ctx = create_test_context_with_config(move |cfg| {
+                    cfg.cargo.proxy = Some(uri);
+                    quarantine_7d(cfg);
+                    cfg.curation.cargo.cooldown_exempt_packages = vec!["oldcrate".into()];
+                    if blocked {
+                        cfg.curation.blocklist_path = Some(blockfile);
+                    } else {
+                        cfg.curation.allowlist_path =
+                            Some(allowfile.to_string_lossy().into_owned());
+                    }
+                });
+                put_written_days_ago(&ctx, "cargo/oldcrate/metadata.json", METADATA, 0).await;
+                if cached {
+                    put_written_days_ago(
+                        &ctx,
+                        "cargo/oldcrate/1.0.0/oldcrate-1.0.0.crate",
+                        b"CRATE",
+                        0,
+                    )
+                    .await;
+                }
+                assert_eq!(
+                    status(&ctx, DOWNLOAD).await,
+                    StatusCode::FORBIDDEN,
+                    "blocked={blocked} cached={cached}"
+                );
+                if blocked {
+                    assert!(crate::test_helpers::upstream_paths(&up).await.is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test]
